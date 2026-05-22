@@ -1,0 +1,15 @@
+groq
+requests
+beautifulsoup4
+python-dotenv
+fastapi
+uvicorn[standard]
+pydantic
+playwright
+openpyxl
+pdfplumber
+curl-c
+pyodbc
+
+
+

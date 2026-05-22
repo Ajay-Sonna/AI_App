@@ -1,0 +1,54 @@
+:root {
+  --app-font: 'Segoe UI', system-ui, -apple-system, Roboto, 'Helvetica Neue', sans-serif;
+  --app-canvas: #f1f5f9;
+  --app-card: #ffffff;
+  --app-card-muted: #f8fafc;
+  --app-text: #334155;
+  --app-heading: #0f172a;
+  --app-muted: #64748b;
+  --app-label: #475569;
+  --app-border: #e2e8f0;
+  --app-border-strong: #cbd5e1;
+  --app-input-bg: #ffffff;
+  --app-code-bg: #f8fafc;
+  --app-sidebar: #1e293b;
+  --app-sidebar-text: #e2e8f0;
+  --app-nav-active-bg: #2563eb;
+  --app-nav-active-fg: #ffffff;
+  --app-header-1: #1e3a8a;
+  --app-header-2: #1d4ed8;
+  --app-accent: #2563eb;
+  --app-accent-hover: #1d4ed8;
+  --app-danger: #dc2626;
+  --app-btn-hover: #f1f5f9;
+  --app-shadow-card: 0 1px 2px rgba(15, 23, 42, 0.06), 0 4px 12px rgba(15, 23, 42, 0.04);
+  --app-shadow-header: 0 2px 8px rgba(15, 23, 42, 0.12);
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--app-font);
+  font-size: 15px;
+  color: var(--app-text);
+  background: var(--app-canvas);
+}
+
+#root {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  min-height: 100vh;
+  text-align: initial;
+  border: none;
+}

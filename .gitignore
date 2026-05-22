@@ -1,0 +1,37 @@
+# Secrets and local env (never commit)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+ENV/
+pip-log.txt
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# Node / frontend
+**/node_modules/
+**/dist/
+**/.vite/
+
+# Playwright / browser cache (if present under project)
+.playwright/
+
+# OS / IDE (optional trims noise)
+.DS_Store
+Thumbs.db
+*.swp
+
+# Local artefact/cache data (downloads, scraped files — do not version)
+/backend/data/
+
+# Logs
+*.log
+npm-debug.log*
