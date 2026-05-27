@@ -72,6 +72,8 @@ from app.extractors.html_catalog import (
 )
 from app.extractors.paginated_catalog import extract_table_catalog_paginated
 from app.extractors.servicenow_catalog import extract_servicenow_catalog
+from app.portals import collect_portal_catalog_extensions
+from app.portals.ga_mmis_postbacks import maybe_resolve_ga_mmis_postbacks
 
 
 def run_catalog_extraction(
@@ -160,6 +162,12 @@ def run_catalog_extraction(
                     fc, fee_document_llm_meta = apply_llm_fee_document_filter(fc, base or url)
                     catalog_tables.append(fc)
 
+        portal_extra_tables, portal_adapters_meta = collect_portal_catalog_extensions(url, bundle)
+        if portal_extra_tables:
+            catalog_tables.extend(portal_extra_tables)
+
+        mmis_ga_resolve_meta = maybe_resolve_ga_mmis_postbacks(url, catalog_tables)
+
         if _tables_have_rows_local(catalog_tables) and len(catalog_tables) > 1:
             catalog_tables = [
                 t
@@ -177,6 +185,10 @@ def run_catalog_extraction(
         }
         if fee_document_llm_meta is not None:
             result["fee_document_llm"] = fee_document_llm_meta
+        if portal_adapters_meta:
+            result["portal_adapters"] = portal_adapters_meta
+        if mmis_ga_resolve_meta.get("attempted_host") or mmis_ga_resolve_meta.get("eligible_mmis_ga_host"):
+            result["mmis_ga_postback_resolve"] = mmis_ga_resolve_meta
         return result
 
     except Exception as e:

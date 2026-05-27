@@ -1,0 +1,25 @@
+# Illustrative recipe (Illinois Medicaid hub → service HTML leaf pages → downloadable files).
+id: nested_html_then_file_harvest__hfs_medicaid_reimbursement
+strategy: expand_internal_html_then_collect_files
+description: >-
+  Matches HFS Medicaid Reimbursement landing hubs; crawls sibling HTML destinations then harvests PDF/XLSX rows.
+match:
+  host_contains: hfs.illinois.gov
+  path_contains: /medicalproviders/medicaidreimbursement
+params:
+  max_nav_depth: 2
+  max_leaf_pages: 90
+  navigation:
+    path_must_contain: /medicalproviders/medicaidreimbursement
+    same_host_only: true
+    max_links_per_page: 180
+    href_exclude_suffixes:
+      - ".pdf"
+      - ".xlsx"
+      - ".xls"
+      - ".csv"
+      - ".docx"
+      - ".zip"
+      - ".xlsm"
+  fetch:
+    timeout_seconds: 32

@@ -5,7 +5,8 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Query
+import pyodbc
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -17,7 +18,7 @@ from app.app_db.artifacts_repo import (
     recompute_is_current_for_state,
 )
 from app.app_db.connection import app_db_configured
-from app.app_db import fee_column_mappings_repo, state_links_repo
+from app.app_db import fee_column_mappings_repo, notification_contacts_repo, state_links_repo
 from app.dst_db.service import (
     _dst_configured,
     _resolve_state_code_column,
@@ -39,8 +40,11 @@ from app.agents.catalog_file_urls import (
     summarize_artifact_link_availability,
 )
 from app.agents.run_agent import run_pipeline
+from app.config.settings import ARTIFACT_DOWNLOAD_MAX_PER_RUN, RUN_PAGINATION_WALL_SECONDS_DEFAULT
 from app.compare_fee_schedules import compare_artifact_to_dst
+from app.mapping_bulk_import import run_bulk_mapping_import
 from app.storage.artifact_download import (
+    build_artifact_browser_download_filename,
     delete_stored_artifact,
     download_fee_schedule_artifact,
     resolve_artifact_path,
@@ -84,7 +88,15 @@ class RunRequest(BaseModel):
     persist_artifacts: bool = True
     paginate: bool = True
     max_pages: int = 50
-    max_tables: int = 12
+    # Fewer parallel table passes keeps /run responsive (each may open Playwright + pagination loop).
+    max_tables: int = 8
+    pagination_wall_seconds: float = Field(RUN_PAGINATION_WALL_SECONDS_DEFAULT, ge=25.0, le=600.0)
+    max_artifact_downloads: int = Field(
+        ARTIFACT_DOWNLOAD_MAX_PER_RUN,
+        ge=0,
+        le=2000,
+        description="0 = unlimited; otherwise cap persisted downloads after this run.",
+    )
 
 
 class PreviewSnippetBody(BaseModel):
@@ -143,6 +155,19 @@ class FeeScheduleCompareRequest(BaseModel):
     dst_fsname: str
 
 
+class NotificationContactUpsert(BaseModel):
+    """Create or update a per-state notification contact (email delivery not implemented yet)."""
+
+    state_code: str
+    contact_name: str = Field(..., min_length=1, max_length=256)
+    email: str = Field(..., min_length=3, max_length=320)
+    team_name: str | None = Field(None, max_length=256)
+    department_name: str | None = Field(None, max_length=256)
+    notifications_enabled: bool = True
+    notify_new_state_file: bool = True
+    notify_compare_result: bool = True
+
+
 def _json_safe_value(v):
     if isinstance(v, datetime):
         return v.isoformat()
@@ -155,6 +180,28 @@ def _json_safe_value(v):
 
 def _json_safe_row(row: dict) -> dict:
     return {k: _json_safe_value(v) for k, v in row.items()}
+
+
+def _notification_contact_api_row(row: dict) -> dict:
+    out = _json_safe_row(dict(row))
+    for k in ("notifications_enabled", "notify_new_state_file", "notify_compare_result"):
+        v = out.get(k)
+        if v is None:
+            out[k] = False
+        elif isinstance(v, bool):
+            pass
+        else:
+            try:
+                out[k] = bool(int(v))
+            except (TypeError, ValueError):
+                out[k] = bool(v)
+    nid = out.get("notification_contact_id")
+    if nid is not None:
+        try:
+            out["notification_contact_id"] = int(nid)
+        except (TypeError, ValueError):
+            pass
+    return out
 
 
 def _column_map_object(cell: Any) -> Dict[str, Any]:
@@ -263,6 +310,7 @@ def run(request: RunRequest):
         paginate=request.paginate,
         max_pages=request.max_pages,
         max_tables=request.max_tables,
+        pagination_wall_seconds=request.pagination_wall_seconds,
     )
     result["resolved_url"] = url
     if sc:
@@ -279,9 +327,19 @@ def run(request: RunRequest):
     ):
         saved: List[Dict[str, Any]] = []
         errors: List[Dict[str, str]] = []
-        file_items = list(collect_file_urls_from_pipeline_result(result, base_url=url))
-        result["artifact_download_candidates"] = len(file_items)
-        for item in file_items:
+        file_items_all = list(collect_file_urls_from_pipeline_result(result, base_url=url))
+        dl_cap = int(request.max_artifact_downloads or 0)
+        kept = file_items_all if dl_cap == 0 else file_items_all[:dl_cap]
+        result["artifact_download_candidates"] = len(file_items_all)
+        result["artifact_download_attempts"] = len(kept)
+        if dl_cap > 0 and len(file_items_all) > len(kept):
+            result["artifact_download_truncated"] = len(file_items_all) - len(kept)
+            logger.info(
+                "Artifact downloads capped at %s (would have been %s); raise max_artifact_downloads or ARTIFACT_DOWNLOAD_MAX_PER_RUN.",
+                dl_cap,
+                len(file_items_all),
+            )
+        for item in kept:
             u = item.get("url") or ""
             try:
                 sup_raw = str(item.get("superseded_hint") or "").strip().lower()
@@ -290,7 +348,11 @@ def run(request: RunRequest):
                     url=u,
                     state_code=sc,
                     logical_schedule_key=(item.get("logical_schedule_key") or "").strip() or None,
-                    source_label=item.get("label") or None,
+                    source_label=(
+                        (item.get("catalog_display_label") or "").strip()
+                        or (item.get("label") or "").strip()
+                        or None
+                    ),
                     referer=url,
                     portal_date_hint=(item.get("portal_date") or "").strip() or None,
                     effective_date_source=(item.get("effective_date_source") or "").strip() or None,
@@ -307,7 +369,7 @@ def run(request: RunRequest):
             recompute_is_current_for_state(state_code=sc)
         except Exception as ex:
             logger.warning("recompute_is_current_for_state failed after run: %s", ex)
-        portal_norm = {normalize_persistable_url(item.get("url") or "") for item in file_items}
+        portal_norm = {normalize_persistable_url(item.get("url") or "") for item in file_items_all}
         portal_norm.discard("")
         pruned = 0
         try:
@@ -550,8 +612,25 @@ def app_serve_artifact_file(artifact_id: int):
         raise HTTPException(status_code=400, detail="Invalid stored path") from None
     if not path.is_file():
         raise HTTPException(status_code=404, detail="File missing on disk")
+    name = build_artifact_browser_download_filename(
+        source_label=row.get("source_label"),
+        original_filename=row.get("original_filename"),
+        path=path,
+        mime_type=row.get("mime_type"),
+        artifact_id=int(artifact_id),
+    )
     media = (row.get("mime_type") or "application/octet-stream").split(";")[0].strip()
-    name = (row.get("original_filename") or path.name) or "download"
+    ln = name.lower()
+    if ln.endswith(".html"):
+        media = "text/html; charset=utf-8"
+    elif ln.endswith(".pdf"):
+        media = "application/pdf"
+    elif ln.endswith(".xlsx") or ln.endswith(".xlsm"):
+        media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    elif ln.endswith(".xls"):
+        media = "application/vnd.ms-excel"
+    elif ln.endswith(".csv"):
+        media = "text/csv; charset=utf-8"
     return FileResponse(path, media_type=media, filename=name)
 
 
@@ -573,7 +652,13 @@ def app_artifact_preview_table(artifact_id: int):
     if not path.is_file():
         raise HTTPException(status_code=404, detail="File missing on disk")
     data = path.read_bytes()
-    name = (row.get("original_filename") or path.name) or "download"
+    name = build_artifact_browser_download_filename(
+        source_label=row.get("source_label"),
+        original_filename=row.get("original_filename"),
+        path=path,
+        mime_type=row.get("mime_type"),
+        artifact_id=int(artifact_id),
+    )
     mime = str(row.get("mime_type") or "")
     out = build_artifact_table_preview(data, original_filename=name, mime_type=mime)
     if not out.get("ok"):
@@ -651,6 +736,126 @@ def app_delete_state_portal_link(link_id: int):
         raise HTTPException(status_code=503, detail="App database not configured.")
     if not state_links_repo.delete_state_portal_link(link_id):
         raise HTTPException(status_code=404, detail="Link not found")
+    return {"ok": True}
+
+
+@app.get("/app/notification-contacts")
+def app_list_notification_contacts(
+    state_code: str = Query(..., description="USPS code; contacts are stored per state."),
+    limit: int = Query(500, ge=1, le=2000),
+):
+    if not app_db_configured():
+        raise HTTPException(status_code=503, detail="App database not configured.")
+    sc = _optional_resolved_state(state_code)
+    if sc is None:
+        raise HTTPException(status_code=400, detail="state_code is required.")
+    try:
+        rows = notification_contacts_repo.list_notification_contacts(state_code=sc, limit=limit)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve)) from ve
+    except Exception as ex:
+        logger.exception("notification-contacts list failed")
+        raise HTTPException(status_code=503, detail=str(ex)) from ex
+    return {"ok": True, "state_code": sc, "contacts": [_notification_contact_api_row(r) for r in rows]}
+
+
+@app.post("/app/notification-contacts")
+def app_create_notification_contact(body: NotificationContactUpsert):
+    if not app_db_configured():
+        raise HTTPException(status_code=503, detail="App database not configured.")
+    sc = _optional_resolved_state(body.state_code)
+    if sc is None:
+        raise HTTPException(status_code=400, detail="state_code is required.")
+    try:
+        new_id = notification_contacts_repo.insert_notification_contact(
+            state_code=sc,
+            contact_name=body.contact_name,
+            email=body.email,
+            team_name=body.team_name,
+            department_name=body.department_name,
+            notifications_enabled=body.notifications_enabled,
+            notify_new_state_file=body.notify_new_state_file,
+            notify_compare_result=body.notify_compare_result,
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve)) from ve
+    except pyodbc.IntegrityError as ie:
+        low = str(ie).lower()
+        if "2627" in str(ie) or "unique" in low:
+            raise HTTPException(
+                status_code=409,
+                detail="A contact with this email already exists for this state.",
+            ) from ie
+        raise HTTPException(status_code=400, detail=str(ie)) from ie
+    except Exception as ex:
+        logger.exception("notification-contacts create failed")
+        raise HTTPException(status_code=503, detail=str(ex)) from ex
+    row = notification_contacts_repo.get_notification_contact(contact_id=new_id, state_code=sc)
+    if not row:
+        return {"ok": True, "notification_contact_id": new_id, "contact": None}
+    return {"ok": True, "notification_contact_id": new_id, "contact": _notification_contact_api_row(row)}
+
+
+@app.put("/app/notification-contacts/{notification_contact_id:int}")
+def app_update_notification_contact(notification_contact_id: int, body: NotificationContactUpsert):
+    if not app_db_configured():
+        raise HTTPException(status_code=503, detail="App database not configured.")
+    sc = _optional_resolved_state(body.state_code)
+    if sc is None:
+        raise HTTPException(status_code=400, detail="state_code is required.")
+    try:
+        ok = notification_contacts_repo.update_notification_contact(
+            contact_id=int(notification_contact_id),
+            state_code=sc,
+            contact_name=body.contact_name,
+            email=body.email,
+            team_name=body.team_name,
+            department_name=body.department_name,
+            notifications_enabled=body.notifications_enabled,
+            notify_new_state_file=body.notify_new_state_file,
+            notify_compare_result=body.notify_compare_result,
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve)) from ve
+    except pyodbc.IntegrityError as ie:
+        low = str(ie).lower()
+        if "2627" in str(ie) or "unique" in low:
+            raise HTTPException(
+                status_code=409,
+                detail="A contact with this email already exists for this state.",
+            ) from ie
+        raise HTTPException(status_code=400, detail=str(ie)) from ie
+    except Exception as ex:
+        logger.exception("notification-contacts update failed")
+        raise HTTPException(status_code=503, detail=str(ex)) from ex
+    if not ok:
+        raise HTTPException(status_code=404, detail="Contact not found for this state.")
+    row = notification_contacts_repo.get_notification_contact(contact_id=int(notification_contact_id), state_code=sc)
+    return {"ok": True, "contact": _notification_contact_api_row(row) if row else None}
+
+
+@app.delete("/app/notification-contacts/{notification_contact_id:int}")
+def app_delete_notification_contact(
+    notification_contact_id: int,
+    state_code: str = Query(..., description="Must match the row’s state_code."),
+):
+    if not app_db_configured():
+        raise HTTPException(status_code=503, detail="App database not configured.")
+    sc = _optional_resolved_state(state_code)
+    if sc is None:
+        raise HTTPException(status_code=400, detail="state_code is required.")
+    try:
+        ok = notification_contacts_repo.delete_notification_contact(
+            contact_id=int(notification_contact_id),
+            state_code=sc,
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve)) from ve
+    except Exception as ex:
+        logger.exception("notification-contacts delete failed")
+        raise HTTPException(status_code=503, detail=str(ex)) from ex
+    if not ok:
+        raise HTTPException(status_code=404, detail="Contact not found for this state.")
     return {"ok": True}
 
 
@@ -827,6 +1032,33 @@ def app_upsert_fee_column_mapping(body: FeeColumnMappingUpsert):
         raise HTTPException(status_code=503, detail=str(ex)) from ex
     cm = _column_map_object(saved.get("column_map_json"))
     return {"ok": True, "mapping": _json_safe_row(saved), "column_map": cm}
+
+
+@app.post("/app/fee-column-mappings/bulk-import")
+async def app_bulk_import_fee_column_mappings(
+    state_code: str = Form(..., description="USPS state code (normalized)"),
+    dry_run: bool = Form(False, description="If true, validate and report without writing rows."),
+    file: UploadFile = File(..., description="CSV or Excel (.xlsx) with bulk mapping rows."),
+):
+    """Upload long-format workbook: StateSchedule/ArtifactId, DstSchedule, StateColumn, DstColumn, optional Action (merge|replace)."""
+    if not app_db_configured():
+        raise HTTPException(status_code=503, detail="App database not configured.")
+    sc = _optional_resolved_state(state_code)
+    if sc is None:
+        raise HTTPException(status_code=400, detail="state_code is required.")
+    try:
+        raw = await file.read()
+    except Exception as ex:
+        logger.exception("bulk-import read failed")
+        raise HTTPException(status_code=400, detail=str(ex)) from ex
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty file")
+
+    try:
+        return run_bulk_mapping_import(state_code=sc, raw_bytes=raw, dry_run=dry_run)
+    except Exception as ex:
+        logger.exception("fee-column-mappings bulk-import failed")
+        raise HTTPException(status_code=503, detail=str(ex)) from ex
 
 
 @app.post("/app/fee-schedules/compare")

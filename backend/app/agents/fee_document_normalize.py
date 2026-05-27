@@ -12,14 +12,13 @@ import logging
 from typing import Any
 
 from app.config.settings import GROQ_API_KEY, LLM_FEE_DOC_FILTER_ENABLED
-from app.llm.llm_client import normalize_fee_document_candidates
+from app.llm.llm_client import (
+    groq_daily_token_budget_exceeded,
+    groq_error_includes_rate_limit,
+    normalize_fee_document_candidates,
+)
 
 _LOG = logging.getLogger(__name__)
-
-
-def _is_rate_limited(msg: str) -> bool:
-    s = msg.lower()
-    return "429" in s or "rate limit" in s or "rate_limit" in s
 
 
 def _slim_rows_for_llm(rows: list[dict[str, Any]], *, max_rows: int = 56) -> list[dict[str, str]]:
@@ -103,12 +102,13 @@ def apply_llm_fee_document_filter(
         _LOG.warning("LLM fee document normalization failed: %s", e)
         err_text = str(e)
         meta["rows_out"] = meta["rows_in"]
-        if _is_rate_limited(err_text):
+        if groq_daily_token_budget_exceeded(e):
+            meta["skipped_reason"] = "groq_daily_token_budget"
+        elif groq_error_includes_rate_limit(e):
             meta["skipped_reason"] = "groq_rate_limit"
-            meta["skipped_detail"] = err_text[:800]
         else:
             meta["skipped_reason"] = "llm_error"
-            meta["skipped_detail"] = err_text[:800]
+        meta["skipped_detail"] = err_text[:800]
         catalog_table["llm_fee_document_filter"] = meta
         return catalog_table, meta
 

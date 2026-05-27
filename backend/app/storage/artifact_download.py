@@ -7,17 +7,19 @@ import ipaddress
 import logging
 import os
 import re
+import unicodedata
 from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import requests
 
 from app.app_db.artifacts_repo import (
     delete_artifact_row,
     get_artifact_by_id,
+    get_artifact_by_state_lsk_content_sha256,
     get_current_artifact_for_logical_key,
     insert_artifact_row,
     recompute_is_current_for_logical_key,
@@ -71,8 +73,8 @@ def _validate_public_http_url(url: str) -> str:
 
 
 def _leaf_filename(url: str) -> str:
-    path = urlparse(url).path or ""
-    leaf = path.rstrip("/").rsplit("/", 1)[-1] or "download"
+    path_raw = urlparse(url).path or ""
+    leaf = unquote(path_raw.rstrip("/").rsplit("/", 1)[-1] or "download")
     leaf = _SAFE_NAME_RE.sub("_", leaf)[:180]
     return leaf or "download"
 
@@ -85,11 +87,167 @@ def _guess_ext(url: str, content_type: Optional[str]) -> str:
     ct = (content_type or "").split(";")[0].strip().lower()
     if "pdf" in ct:
         return ".pdf"
-    if "spreadsheet" in ct or "excel" in ct:
+    if "spreadsheet" in ct or "excel" in ct or "sheet" in ct:
         return ".xlsx"
     if "csv" in ct:
         return ".csv"
+    if "html" in ct:
+        return ".html"
     return ""
+
+
+def _stem_before_extension(leaf: str) -> str:
+    leaf = (leaf or "").strip()
+    if not leaf:
+        return "download"
+    dot = leaf.rfind(".")
+    if dot <= 0:
+        return leaf
+    tail = leaf[dot + 1 :]
+    # Treat last segment as extension when short and identifier-like (e.g. .xlsx, .pdf).
+    if 1 <= len(tail) <= 6 and re.fullmatch(r"[A-Za-z0-9]+", tail):
+        return leaf[:dot] or leaf
+    return leaf
+
+
+def _sniff_suffix_and_mime(header: bytes) -> Tuple[str, str]:
+    if not header:
+        return "", ""
+    h = header.lstrip(b"\xef\xbb\xbf")
+    if len(h) < 4:
+        return "", ""
+    if h.startswith(b"%PDF"):
+        return ".pdf", "application/pdf"
+    scan = header[:8192].lower()
+    if (
+        h.startswith((b"<!", b"<?"))
+        or (
+            h.startswith(b"<")
+            and (b"<html" in scan or b"<!doctype html" in scan or b"<head" in scan or b"<body" in scan)
+        )
+    ):
+        return ".html", "text/html; charset=utf-8"
+    if h.startswith(b"PK\x03\x04"):
+        return ".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    if len(h) >= 8 and h.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        return ".xls", "application/vnd.ms-excel"
+    return "", ""
+
+
+def refine_download_leaf_and_mime(
+    *, tmp_path: Path, leaf: str, url: str, content_type_header: Optional[str]
+) -> Tuple[str, str]:
+    """Prefer magic-byte detection over URL / Content-Type when they disagree (opaque ServiceNow paths)."""
+    stem = _stem_before_extension(leaf) or "download"
+    try:
+        sniff = tmp_path.read_bytes()[:512]
+    except OSError:
+        sniff = b""
+    suf_sniff, mime_sniff = _sniff_suffix_and_mime(sniff)
+    ct = (content_type_header or "").split(";")[0].strip()[:256]
+
+    if suf_sniff:
+        mime_out = (mime_sniff.split(";")[0].strip()[:256]) if mime_sniff else ct
+        return stem + suf_sniff, mime_out or ct
+
+    g = _guess_ext(url, content_type_header)
+    if not g:
+        return leaf if leaf else stem, ct if ct else "application/octet-stream"
+    leaf_lower = (leaf or "").lower()
+    if leaf_lower.endswith(g):
+        return leaf, ct if ct else "application/octet-stream"
+    base = stem
+    return base + g, ct if ct else "application/octet-stream"
+
+
+_GARBAGE_LABELS = frozenset({"download", "download file", "click here", "here", "file"})
+
+
+def _looks_like_opaque_url_stem(stem: str) -> bool:
+    s = stem.strip().replace("-", "").replace("_", "").replace(".", "")
+    if len(s) >= 28 and re.fullmatch(r"[a-f0-9]+", s, re.I):
+        return True
+    return bool(
+        re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", stem.strip(), re.I),
+    )
+
+
+def _safe_user_filename_stem(raw: str, *, max_len: int = 120) -> str:
+    s = unicodedata.normalize("NFKD", raw).replace("\u2014", "-").replace("\u2013", "-")
+    s = os.path.basename(s.replace("\\", "/").split("/")[-1])
+    low = s.lower().rstrip()
+    for ext_try in (".xlsx", ".xls", ".pdf", ".csv", ".zip", ".html"):
+        if low.endswith(ext_try):
+            s = s[: -len(ext_try)]
+            break
+    s = re.sub(r"""[<>:"/\\|?*\x00-\x1f]""", "_", s)
+    s = re.sub(r"\s+", " ", s).strip(" ._")
+    s = re.sub(r"_+", "_", s).strip("_")
+    if len(s) > max_len:
+        s = s[:max_len].rstrip(" ._")
+    return s
+
+
+def build_artifact_browser_download_filename(
+    *,
+    source_label: Optional[str],
+    original_filename: Optional[str],
+    path: Path,
+    mime_type: Optional[str],
+    artifact_id: int,
+) -> str:
+    """
+    Human-friendly name for ``Content-Disposition`` (browser download).
+
+    ServiceNow often stores ``original_filename`` as an opaque GUID; prefer ``source_label`` when present.
+    """
+    try:
+        aid = int(artifact_id)
+    except (TypeError, ValueError):
+        aid = 0
+
+    ext = path.suffix
+    if (not ext or len(ext) > 8) and (original_filename or "").strip():
+        of_stem = Path((original_filename or "").strip()).suffix
+        if of_stem and len(of_stem) <= 8:
+            ext = of_stem
+    try:
+        sz = path.stat().st_size
+        if sz > 0:
+            with path.open("rb") as f:
+                sniff_head = f.read(min(512, sz))
+            sniff_suf, _ = _sniff_suffix_and_mime(sniff_head)
+            if sniff_suf:
+                ext = sniff_suf
+    except OSError:
+        pass
+    if not ext:
+        mt = (mime_type or "").lower()
+        if "pdf" in mt:
+            ext = ".pdf"
+        elif "spreadsheet" in mt or "excel" in mt or "sheet" in mt:
+            ext = ".xlsx"
+        elif "csv" in mt:
+            ext = ".csv"
+        elif "html" in mt:
+            ext = ".html"
+        else:
+            ext = ""
+
+    label = (source_label or "").strip()
+    if label and len(label) > 2 and label.lower() not in _GARBAGE_LABELS:
+        stem = _safe_user_filename_stem(label)
+        if stem:
+            return f"{stem}{ext}" if ext else stem
+
+    ofn = (original_filename or path.name or "").strip()
+    stem2 = Path(ofn).stem if ofn else ""
+    if stem2.strip() and _looks_like_opaque_url_stem(stem2):
+        stem2 = f"fee_schedule_{aid}" if aid else "fee_schedule"
+    if not stem2:
+        stem2 = f"fee_schedule_{aid}" if aid else "fee_schedule_download"
+    stem2 = _safe_user_filename_stem(stem2) or (f"fee_schedule_{aid}" if aid else "fee_schedule_download")
+    return f"{stem2}{ext}" if ext else stem2
 
 
 def _slug_folder(logical_schedule_key: str) -> str:
@@ -166,10 +324,14 @@ def _download_public_file_to_path(
     _maybe_warm_referrer(session, safe_url, rp, None)
 
     last_status = -1
+    hard_client_fail = False
     for hdr in attempts:
         try:
             with session.get(safe_url, stream=True, timeout=120, headers=hdr, allow_redirects=True) as resp:
                 last_status = resp.status_code
+                if resp.status_code in (404, 410):
+                    hard_client_fail = True
+                    break
                 if resp.status_code >= 400:
                     continue
                 ctype = resp.headers.get("content-type")
@@ -191,6 +353,9 @@ def _download_public_file_to_path(
             if destination.exists():
                 destination.unlink(missing_ok=True)
             continue
+
+    if hard_client_fail:
+        raise RuntimeError(f"HTTP {last_status} download failed for url: {safe_url}")
 
     sec_ref = _referrer_for_sec_fetch(safe_url, referer_portal)
     ref_curl = (referer_portal or "").strip() or sec_ref
@@ -248,15 +413,38 @@ def _download_public_file_to_path(
 
 
 def _parse_portal_effective_date(hint: Optional[str]) -> Optional[date]:
-    """``YYYY-MM-DD`` from catalog / API hint."""
+    """Normalize catalog / manual hints such as ISO, MM/DD/YYYY, MM-DD-YYYY (+ optional time)."""
     if not hint or not str(hint).strip():
         return None
-    s = str(hint).strip()[:32]
-    try:
-        y, mo, d = s.split("-", 2)
-        return date(int(y), int(mo), int(d))
-    except (ValueError, TypeError):
-        return None
+    s = str(hint).strip()[:48]
+    if re.match(r"^\d{4}-\d{2}-\d{2}", s):
+        try:
+            y, mo, d = s[:10].split("-", 2)
+            return date(int(y), int(mo), int(d))
+        except (ValueError, TypeError):
+            return None
+    for fmt in (
+        "%m-%d-%Y %H:%M:%S",
+        "%m-%d-%Y %H:%M",
+        "%m-%d-%Y",
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M",
+        "%m/%d/%Y",
+        "%d-%m-%Y",
+        "%Y/%m/%d",
+    ):
+        try:
+            return datetime.strptime(s[:29], fmt).date()
+        except ValueError:
+            continue
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", s)
+    if m:
+        try:
+            y, mo, d = m.group(1).split("-", 2)
+            return date(int(y), int(mo), int(d))
+        except (ValueError, TypeError):
+            return None
+    return None
 
 
 def _skip_response(
@@ -293,7 +481,8 @@ def download_fee_schedule_artifact(
     Download ``url`` under ``{ARTIFACT_ROOT}/{state}/{logical_folder}/``, register in DB.
     ``is_current`` is assigned by date-primary recompute (latest effective date per logical schedule).
 
-    Skips full download when an existing current row's ETag matches, or same URL bytes (SHA256) as current.
+    Skips full download when an existing current row's ETag matches. After GET, skips insert when SHA256 matches
+    any prior row for this (state, logical_schedule_key)—not only ``is_current``—to avoid duplicate version rows.
     """
     safe_url = _validate_public_http_url(url)
     sc_raw = (state_code or "").strip()
@@ -314,6 +503,8 @@ def download_fee_schedule_artifact(
 
     try:
         head = requests.head(safe_url, headers=hdr_attempts[0], allow_redirects=True, timeout=45)
+        if head.status_code in (404, 410):
+            raise RuntimeError(f"HTTP {head.status_code} HEAD indicates missing resource: {safe_url}")
         if head.ok and cur_row:
             etag = _norm_etag(head.headers.get("ETag"))
             db_etag = _norm_etag(cur_row.get("remote_etag"))
@@ -325,17 +516,25 @@ def download_fee_schedule_artifact(
     tmp_path = target_dir / f".part_{os.getpid()}_{hashlib.md5(safe_url.encode('utf-8'), usedforsecurity=False).hexdigest()[:10]}"
     total, digest, ctype, etag_final, lm_final = _download_public_file_to_path(safe_url, referer, tmp_path)
 
-    ext = _guess_ext(safe_url, ctype)
-    if ext and not leaf.lower().endswith(ext):
-        if "." not in leaf:
-            leaf = leaf + ext
-    if cur_row and str(cur_row.get("content_sha256") or "") == digest:
+    leaf, ctype_for_db = refine_download_leaf_and_mime(
+        tmp_path=tmp_path,
+        leaf=leaf,
+        url=safe_url,
+        content_type_header=ctype,
+    )
+    hist = get_artifact_by_state_lsk_content_sha256(
+        state_code=sc,
+        logical_schedule_key=lsk,
+        content_sha256=digest,
+    )
+    if hist:
         tmp_path.unlink(missing_ok=True)
-        return _skip_response(row=cur_row, root=root, reason="sha256_unchanged")
+        return _skip_response(row=hist, root=root, reason="sha256_known")
 
-    portal_date = (portal_date_hint or "").strip()[:32]
+    hint_stripped = (portal_date_hint or "").strip()[:64]
+    ped = _parse_portal_effective_date(hint_stripped or None)
     day_fetch = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    date_prefix = portal_date if portal_date else day_fetch
+    date_prefix = ped.isoformat() if ped is not None else (hint_stripped[:32] if hint_stripped else day_fetch)
     final_name = f"{date_prefix}__{digest[:16]}_{leaf}"
     final_path = target_dir / final_name
     if final_path.exists():
@@ -348,7 +547,6 @@ def download_fee_schedule_artifact(
 
     lm_sql = lm_final.replace(tzinfo=None) if lm_final else None
 
-    ped = _parse_portal_effective_date(portal_date_hint)
     src_eff = (effective_date_source or "").strip()[:32] or None
     if ped is not None and not src_eff:
         src_eff = "catalog"
@@ -359,7 +557,7 @@ def download_fee_schedule_artifact(
         content_sha256=digest,
         stored_rel_path=rel_path,
         original_filename=leaf,
-        mime_type=(ctype or "").split(";")[0].strip()[:256] or None,
+        mime_type=(ctype_for_db or "").strip()[:256] or None,
         bytes_size=total,
         source_label=source_label,
         remote_etag=etag_final,

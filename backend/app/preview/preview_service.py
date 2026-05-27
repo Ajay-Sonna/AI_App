@@ -667,6 +667,78 @@ def _is_ooxlsx_workbook(data: bytes) -> bool:
         return False
 
 
+def _is_docx_ooxml(data: bytes) -> bool:
+    """Zip package with Word main document part (Open XML .docx)."""
+    try:
+        if not zipfile.is_zipfile(io.BytesIO(data)):
+            return False
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            names = frozenset(zf.namelist())
+        return "[Content_Types].xml" in names and "word/document.xml" in names
+    except Exception:
+        return False
+
+
+_OLECF_HEADER = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def _looks_like_olecf(data: bytes) -> bool:
+    return bool(data) and len(data) >= 8 and data[:8] == _OLECF_HEADER
+
+
+def _looks_like_html_bytes(data: bytes) -> bool:
+    """Many fee portals return an HTML login or error page with a misleading file name."""
+    head = data.lstrip()[:512].lower()
+    return head.startswith((b"<!doctype html", b"<html", b"<!--"))
+
+
+def _maybe_decrypt_ooxml_workbook(data: bytes) -> bytes:
+    """
+    Standard Office Open XML can be ``encrypted`` (Agile). When the workbook uses a blank
+    password (or is trivially decryptable with an empty key), msoffcrypto can unwrap it so
+    openpyxl / calamine can read the inner package.
+    """
+    if not data or len(data) < 64:
+        return data
+    try:
+        import msoffcrypto
+    except ImportError:
+        return data
+    bio = io.BytesIO(data)
+    try:
+        office = msoffcrypto.OfficeFile(bio)
+    except Exception:
+        return data
+    try:
+        if not office.is_encrypted():
+            return data
+    except Exception:
+        return data
+    try:
+        office.load_key(password="")
+    except Exception:
+        return data
+    try:
+        out = io.BytesIO()
+        office.decrypt(out)
+        dec = out.getvalue()
+        return dec if len(dec) > 64 else data
+    except Exception:
+        return data
+
+
+def _openpyxl_load_bytes(data: bytes, *, read_only: bool, data_only: bool):
+    import openpyxl
+
+    return openpyxl.load_workbook(
+        io.BytesIO(data),
+        read_only=read_only,
+        data_only=data_only,
+        keep_links=False,
+        rich_text=False,
+    )
+
+
 def _kind_from_signals(
     content_type: Optional[str],
     url: str,
@@ -680,9 +752,12 @@ def _kind_from_signals(
     if sniff.startswith(b"%PDF") or ct == "application/pdf":
         return "pdf"
 
+    if path.endswith(".docx") or "wordprocessingml.document" in ct or _is_docx_ooxml(data):
+        return "word_docx"
+
+    spreadsheet_ct = ("spreadsheet" in ct or "excel" in ct) and "wordprocessing" not in ct
     if (
-        "spreadsheet" in ct
-        or "excel" in ct
+        spreadsheet_ct
         or path.endswith(".xlsx")
         or path.endswith(".xls")
         or _is_ooxlsx_workbook(data)
@@ -1027,151 +1102,153 @@ def _finalize_preview_table(hdr: List[Any], rows: List[List[Any]]) -> Tuple[List
     return hdr2, body2
 
 
+def _grid_to_fee_preview_table(
+    raw_scan: List[List[Any]],
+    max_rows: int,
+) -> Tuple[Optional[List[str]], Optional[List[List[Any]]]]:
+    """Pick header row + body from a rectangular grid (openpyxl read_only or calamine)."""
+    if not raw_scan or len(raw_scan) < 2:
+        return None, None
+    hdr_idx = _find_likely_grid_header_index(raw_scan)
+    hdr_row = [_normalize_cell_header(c) for c in raw_scan[hdr_idx]]
+    width = max(len(hdr_row), max((len(r) for r in raw_scan[hdr_idx:]), default=0))
+    hdr = _normalize_row_len(hdr_row, width)
+    hdr = [str(c).strip() if str(c).strip() else f"col_{k + 1}" for k, c in enumerate(hdr)]
+    rows_out: List[List[Any]] = []
+    for r in raw_scan[hdr_idx + 1 :]:
+        if len(rows_out) >= max_rows:
+            break
+        line = _normalize_row_len(r, width)
+        if not any(str(c).strip() for c in line):
+            continue
+        if str(line[0]).strip().lower().startswith("note"):
+            continue
+        rows_out.append(line)
+    rows_fmt = _maybe_format_percent_cells(hdr, rows_out)
+    nh, nr = _finalize_preview_table(hdr, rows_fmt)
+    if not nh:
+        return None, None
+    return nh, nr
+
+
+def _table_from_xlsx_calamine(
+    data: bytes,
+    max_rows: int,
+    scan_cap: int,
+) -> Tuple[Optional[List[str]], Optional[List[List[Any]]]]:
+    """Rust calamine reader: handles many workbooks that trip openpyxl."""
+    try:
+        from python_calamine import CalamineWorkbook
+    except ImportError:
+        return None, None
+    grid_any: List[List[Any]] = []
+    try:
+        wb = CalamineWorkbook.from_object(io.BytesIO(data))
+        try:
+            if not wb.sheet_names:
+                return None, None
+            sheet = wb.get_sheet_by_index(0)
+            grid_any = sheet.to_python(skip_empty_area=False)
+        finally:
+            try:
+                wb.close()
+            except Exception:
+                pass
+    except Exception:
+        return None, None
+
+    raw_scan: List[List[Any]] = []
+    for r in grid_any[:scan_cap]:
+        row = list(r[:64]) if len(r) > 64 else list(r)
+        raw_scan.append([(c if c is not None else "") for c in row])
+    return _grid_to_fee_preview_table(raw_scan, max_rows)
+
+
 def _table_from_xlsx_merge_aware(
     data: bytes,
     max_rows: int,
     scan_cap: int,
 ):
     """Full workbook read with merged-cell expansion + two-row header band (fee summary sheets)."""
+    wb = None
     try:
-        import openpyxl
-    except ImportError:
-        return None, None
+        wb = _openpyxl_load_bytes(data, read_only=False, data_only=True)
+        ws = wb.active
+        max_r = _ws_scan_last_row(ws, scan_cap)
+        max_c = min(int(ws.max_column or 0), 64)
+        if max_r < 2 or max_c < 2:
+            return None, None
 
-    try:
-        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=False, data_only=True)
-        try:
-            ws = wb.active
-            max_r = _ws_scan_last_row(ws, scan_cap)
-            max_c = min(int(ws.max_column or 0), 64)
-            if max_r < 2 or max_c < 2:
-                return None, None
+        grid: List[List[Any]] = []
+        for r in range(1, max_r + 1):
+            row = [ws.cell(r, c).value for c in range(1, max_c + 1)]
+            grid.append(row)
 
-            grid: List[List[Any]] = []
-            for r in range(1, max_r + 1):
-                row = [ws.cell(r, c).value for c in range(1, max_c + 1)]
-                grid.append(row)
-
-            for mrange in list(ws.merged_cells.ranges):
-                min_rr, min_cc, max_rr, max_cc = (
-                    mrange.min_row,
-                    mrange.min_col,
-                    mrange.max_row,
-                    mrange.max_col,
-                )
-                v = ws.cell(min_rr, min_cc).value
-                for rr in range(min_rr, max_rr + 1):
-                    for cc in range(min_cc, max_cc + 1):
-                        if 1 <= rr <= max_r and 1 <= cc <= max_c:
-                            grid[rr - 1][cc - 1] = v
-
-            for ri, row in enumerate(grid):
-                for ci, cell in enumerate(row):
-                    if cell is None:
-                        grid[ri][ci] = ""
-
-            hdr_idx = _find_likely_grid_header_index(grid)
-            width = max(
-                len(grid[hdr_idx]),
-                max((len(r) for r in grid[hdr_idx:]), default=0),
-                max_c,
+        for mrange in list(ws.merged_cells.ranges):
+            min_rr, min_cc, max_rr, max_cc = (
+                mrange.min_row,
+                mrange.min_col,
+                mrange.max_row,
+                mrange.max_col,
             )
-            width = min(width, max_c)
+            v = ws.cell(min_rr, min_cc).value
+            for rr in range(min_rr, max_rr + 1):
+                for cc in range(min_cc, max_cc + 1):
+                    if 1 <= rr <= max_r and 1 <= cc <= max_c:
+                        grid[rr - 1][cc - 1] = v
 
-            combined_headers: Optional[List[str]] = None
+        for ri, row in enumerate(grid):
+            for ci, cell in enumerate(row):
+                if cell is None:
+                    grid[ri][ci] = ""
+
+        hdr_idx = _find_likely_grid_header_index(grid)
+        width = max(
+            len(grid[hdr_idx]),
+            max((len(r) for r in grid[hdr_idx:]), default=0),
+            max_c,
+        )
+        width = min(width, max_c)
+
+        combined_headers: Optional[List[str]] = None
+        data_start = hdr_idx + 1
+        if hdr_idx > 0 and _header_pair_merge_worthy(
+            grid[hdr_idx - 1], grid[hdr_idx], width, grid, hdr_idx
+        ):
+            combined_headers = _combine_two_header_rows(grid[hdr_idx - 1], grid[hdr_idx], width)
             data_start = hdr_idx + 1
-            if hdr_idx > 0 and _header_pair_merge_worthy(
-                grid[hdr_idx - 1], grid[hdr_idx], width, grid, hdr_idx
-            ):
-                combined_headers = _combine_two_header_rows(grid[hdr_idx - 1], grid[hdr_idx], width)
-                data_start = hdr_idx + 1
-            elif hdr_idx > 0 and _nonempty_width(_normalize_row_len(grid[hdr_idx - 1], width)) >= 3:
-                dln = (
-                    _row_data_likeness(grid[hdr_idx])
-                    if hdr_idx < len(grid)
-                    else 0
+        elif hdr_idx > 0 and _nonempty_width(_normalize_row_len(grid[hdr_idx - 1], width)) >= 3:
+            dln = (
+                _row_data_likeness(grid[hdr_idx])
+                if hdr_idx < len(grid)
+                else 0
+            )
+            qln = _nonempty_width(_normalize_row_len(grid[hdr_idx], width))
+            if dln <= 2 and qln >= 4:
+                prev_h = [_normalize_cell_header(c) for c in _normalize_row_len(grid[hdr_idx - 1], width)]
+                prev_rn = grid[hdr_idx - 1]
+                prev_ok = (
+                    _row_rate_identifier_count(prev_rn) <= 1
+                    and _row_numeric_like_count(prev_rn) <= 2
+                    and _row_data_likeness(prev_rn) <= max(3, _nonempty_width(prev_rn) // 2)
                 )
-                qln = _nonempty_width(_normalize_row_len(grid[hdr_idx], width))
-                if dln <= 2 and qln >= 4:
-                    prev_h = [_normalize_cell_header(c) for c in _normalize_row_len(grid[hdr_idx - 1], width)]
-                    prev_rn = grid[hdr_idx - 1]
-                    prev_ok = (
-                        _row_rate_identifier_count(prev_rn) <= 1
-                        and _row_numeric_like_count(prev_rn) <= 2
-                        and _row_data_likeness(prev_rn) <= max(3, _nonempty_width(prev_rn) // 2)
-                    )
-                    if prev_ok and any(
-                        re.search(r"(workforce|hcbs|rescue|rate increase)", str(x).lower()) for x in prev_h
-                    ):
-                        combined_headers = _combine_two_header_rows(grid[hdr_idx - 1], grid[hdr_idx], width)
-                        data_start = hdr_idx + 1
+                if prev_ok and any(
+                    re.search(r"(workforce|hcbs|rescue|rate increase)", str(x).lower()) for x in prev_h
+                ):
+                    combined_headers = _combine_two_header_rows(grid[hdr_idx - 1], grid[hdr_idx], width)
+                    data_start = hdr_idx + 1
 
-            if combined_headers:
-                hdr_row = combined_headers
-            else:
-                hdr_row = [_normalize_cell_header(c) for c in _normalize_row_len(grid[hdr_idx], width)]
+        if combined_headers:
+            hdr_row = combined_headers
+        else:
+            hdr_row = [_normalize_cell_header(c) for c in _normalize_row_len(grid[hdr_idx], width)]
 
-            hdr_row = _normalize_row_len(hdr_row, width)
-            hdr_clean = [
-                str(c).strip() if str(c).strip() else f"col_{k + 1}" for k, c in enumerate(hdr_row)
-            ]
-            rows_out: List[List[Any]] = []
-            for r in grid[data_start:]:
-                if len(rows_out) >= max_rows:
-                    break
-                line = _normalize_row_len(r, width)
-                if not any(str(c).strip() for c in line):
-                    continue
-                if str(line[0]).strip().lower().startswith("note"):
-                    continue
-                rows_out.append(line)
-
-            rows_fmt = _maybe_format_percent_cells(hdr_clean, rows_out)
-            nh, nr = _finalize_preview_table(hdr_clean, rows_fmt)
-            if not nh:
-                return None, None
-            return nh, nr
-        finally:
-            wb.close()
-    except Exception:
-        return None, None
-
-
-def _table_from_xlsx(
-    data: bytes,
-    max_rows: int,
-    *,
-    max_scan_rows: Optional[int] = None,
-):
-    try:
-        import openpyxl
-    except ImportError:
-        return None, None
-
-    scan_cap = max_scan_rows if max_scan_rows is not None else _MAX_SCAN_ROWS
-
-    if len(data) <= _RICH_XLSX_BYTES_CAP:
-        hit = _table_from_xlsx_merge_aware(data, max_rows, scan_cap)
-        if hit[0] is not None:
-            return hit
-
-    try:
-        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-        ws = wb[wb.sheetnames[0]]
-        raw_scan: List[List[Any]] = []
-        for _, row in enumerate(ws.iter_rows(values_only=True)):
-            raw_scan.append([(c if c is not None else "") for c in row[:64]])
-            if len(raw_scan) >= scan_cap:
-                break
-
-        hdr_idx = _find_likely_grid_header_index(raw_scan)
-        hdr_row = [_normalize_cell_header(c) for c in raw_scan[hdr_idx]]
-        width = max(len(hdr_row), max((len(r) for r in raw_scan[hdr_idx:]), default=0))
-
-        hdr = _normalize_row_len(hdr_row, width)
-        hdr = [str(c).strip() if str(c).strip() else f"col_{k + 1}" for k, c in enumerate(hdr)]
+        hdr_row = _normalize_row_len(hdr_row, width)
+        hdr_clean = [
+            str(c).strip() if str(c).strip() else f"col_{k + 1}" for k, c in enumerate(hdr_row)
+        ]
         rows_out: List[List[Any]] = []
-        for r in raw_scan[hdr_idx + 1 :]:
+        for r in grid[data_start:]:
             if len(rows_out) >= max_rows:
                 break
             line = _normalize_row_len(r, width)
@@ -1181,14 +1258,66 @@ def _table_from_xlsx(
                 continue
             rows_out.append(line)
 
-        wb.close()
-        rows_fmt = _maybe_format_percent_cells(hdr, rows_out)
-        nh, nr = _finalize_preview_table(hdr, rows_fmt)
+        rows_fmt = _maybe_format_percent_cells(hdr_clean, rows_out)
+        nh, nr = _finalize_preview_table(hdr_clean, rows_fmt)
         if not nh:
             return None, None
         return nh, nr
+    except ImportError:
+        return None, None
     except Exception:
         return None, None
+    finally:
+        if wb is not None:
+            try:
+                wb.close()
+            except Exception:
+                pass
+
+
+def _table_from_xlsx(
+    data: bytes,
+    max_rows: int,
+    *,
+    max_scan_rows: Optional[int] = None,
+):
+    scan_cap = max_scan_rows if max_scan_rows is not None else _MAX_SCAN_ROWS
+    blob = _maybe_decrypt_ooxml_workbook(data)
+
+    openpyxl_ok = True
+    try:
+        import openpyxl  # noqa: F401
+    except ImportError:
+        openpyxl_ok = False
+
+    if openpyxl_ok and len(blob) <= _RICH_XLSX_BYTES_CAP:
+        hit = _table_from_xlsx_merge_aware(blob, max_rows, scan_cap)
+        if hit[0] is not None:
+            return hit
+
+    if openpyxl_ok:
+        wb = None
+        try:
+            wb = _openpyxl_load_bytes(blob, read_only=True, data_only=True)
+            ws = wb[wb.sheetnames[0]]
+            raw_scan: List[List[Any]] = []
+            for _, row in enumerate(ws.iter_rows(values_only=True)):
+                raw_scan.append([(c if c is not None else "") for c in row[:64]])
+                if len(raw_scan) >= scan_cap:
+                    break
+            hit = _grid_to_fee_preview_table(raw_scan, max_rows)
+            if hit[0] is not None:
+                return hit
+        except Exception:
+            pass
+        finally:
+            if wb is not None:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
+
+    return _table_from_xlsx_calamine(blob, max_rows, scan_cap)
 
 
 def _normalize_cell_header(c: Any) -> str:
@@ -1354,6 +1483,15 @@ def build_preview_payload(
         out["hint"] = "Leading non-tabular rows were skipped where a main grid could be inferred."
         return out
 
+    if kind == "word_docx":
+        dz = _build_docx_preview(blob, MAX_PREVIEW_ROWS)
+        if dz.get("ok"):
+            out["detected_kind"] = str(dz.get("preview_kind") or "word_docx")
+            out["table_preview"] = {"columns": dz["columns"], "rows": dz["rows"]}
+            out["hint"] = "Word (.docx): extracted tables when present; otherwise paragraph text."
+            return out
+        kind = "binary"
+
     if kind == "spreadsheet":
         hdr, rows = _table_from_xlsx(blob, MAX_PREVIEW_ROWS)
         if hdr is not None and rows is not None:
@@ -1517,6 +1655,110 @@ def streaming_fetch_resource(
     return None, f"upstream_{last_status or 502}"
 
 
+def _preview_message_grid(lines: List[str], *, preview_kind: str = "message_fallback") -> Dict[str, Any]:
+    """Always-viewable grid for unsupported binaries or advisory text."""
+    rows = [[ln] for ln in lines if str(ln or "").strip()]
+    if not rows:
+        rows = [["(empty)"]]
+    return {"ok": True, "preview_kind": preview_kind, "columns": ["Preview"], "rows": rows[: ARTIFACT_TABLE_MAX_ROWS]}
+
+
+def _build_docx_preview(data: bytes, max_rows: int) -> Dict[str, Any]:
+    """Extract tables from .docx, else paragraphs as a single column."""
+    try:
+        from docx import Document
+    except ImportError:
+        return {"ok": False, "error": "python-docx is not installed on the API host."}
+
+    try:
+        doc = Document(io.BytesIO(data))
+    except Exception:
+        return {"ok": False, "error": "Unreadable Word (.docx) payload — file may be corrupt."}
+
+    grid_rows: List[List[Any]] = []
+    for table in getattr(doc, "tables", []) or []:
+        for row in table.rows:
+            if len(grid_rows) >= max_rows:
+                break
+            cells = [str(c.text or "").replace("\r", "").replace("\n", " ").strip() for c in row.cells]
+            if any(x.strip() for x in cells):
+                grid_rows.append(cells)
+        if len(grid_rows) >= max_rows:
+            break
+
+    if grid_rows:
+        w = max(len(r) for r in grid_rows)
+        normed = [_normalize_row_len(list(r), w) for r in grid_rows]
+        hi = _find_likely_grid_header_index(normed, min_cols=min(3, max(2, w)))
+        hdr_cells = [_normalize_cell_header(c) for c in normed[hi]]
+        hdr = _normalize_row_len(hdr_cells, w)
+        hdr_out = [
+            str(c).strip() if str(c).strip() else f"col_{k + 1}" for k, c in enumerate(hdr)
+        ]
+        rows_out: List[List[Any]] = []
+        for r in normed[hi + 1 :]:
+            if len(rows_out) >= max_rows:
+                break
+            line = _normalize_row_len(r, w)
+            if not any(str(c).strip() for c in line):
+                continue
+            rows_out.append(line)
+        rows_fmt = _maybe_format_percent_cells(hdr_out, rows_out)
+        tc, tb = _finalize_preview_table(hdr_out, rows_fmt)
+        if tc:
+            return {"ok": True, "preview_kind": "docx_table", "columns": tc, "rows": tb}
+
+    paras = []
+    for p in getattr(doc, "paragraphs", []) or []:
+        t = (getattr(p, "text", None) or "").replace("\r", "").strip()
+        if t:
+            paras.append(t)
+        if len(paras) >= max_rows:
+            break
+    if not paras:
+        return {
+            "ok": True,
+            "preview_kind": "docx_empty",
+            "columns": ["Paragraph"],
+            "rows": [["(No body text or tables in this document.)"]],
+        }
+    rows = [[t] for t in paras[:max_rows]]
+    return {"ok": True, "preview_kind": "docx_prose", "columns": ["Paragraph"], "rows": rows}
+
+
+def _try_text_line_preview(data: bytes, *, max_lines: int = 5000) -> Optional[Dict[str, Any]]:
+    """UTF-8 / UTF-16 text-ish preview as a two-column grid."""
+    text: Optional[str] = None
+    for enc in ("utf-8-sig", "utf-8", "utf-16-le", "utf-16-be", "latin-1"):
+        try:
+            text = data.decode(enc)
+            break
+        except Exception:
+            continue
+    if text is None:
+        try:
+            text = data.decode("utf-8-sig", errors="replace")
+        except Exception:
+            return None
+
+    lines: List[str] = []
+    for ln in text.replace("\r\n", "\n").split("\n"):
+        s = ln.strip()
+        if not s:
+            continue
+        lines.append(s[:4000])
+        if len(lines) >= max_lines:
+            break
+    if not lines:
+        return None
+    return {
+        "ok": True,
+        "preview_kind": "text_lines",
+        "columns": ["#", "Line"],
+        "rows": [[str(i + 1), lines[i]] for i in range(len(lines))],
+    }
+
+
 def build_artifact_table_preview(
     data: bytes,
     *,
@@ -1524,8 +1766,10 @@ def build_artifact_table_preview(
     mime_type: str = "",
 ) -> Dict[str, Any]:
     """
-    Parse a saved artifact (PDF / Excel / CSV) into a column + row grid for the SPA fee preview.
-    Returns ``{ok, columns, rows}`` or ``{ok: False, error}``.
+    Parse a saved artifact into a tabular-ish grid for the SPA (PDF tables, CSV/Excel, Word ``.docx``,
+    text lines, plus advisory rows when no structured extractor applies).
+
+    Returns ``{ok, columns, rows}`` (and optional ``preview_kind``) or ``{ok: False, error}``.
     """
     name = (original_filename or "").lower()
     mt = (mime_type or "").split(";")[0].strip().lower()
@@ -1543,15 +1787,48 @@ def build_artifact_table_preview(
             ph, pr = _table_from_pdf_vector(merged, ARTIFACT_TABLE_MAX_ROWS)
             if ph is not None and pr is not None:
                 return {"ok": True, "columns": ph, "rows": pr}
+        return _preview_message_grid(
+            [
+                "PDF preview could not extract a ruled table.",
+                "Open the downloaded file in Acrobat or your browser.",
+            ],
+            preview_kind="pdf_fallback",
+        )
+
+    docx_hit = (
+        name.endswith(".docx")
+        or "wordprocessingml.document" in mt
+        or ("wordprocessingml" in mt and "document" in mt)
+        or _is_docx_ooxml(raw)
+    )
+    if docx_hit:
+        if _looks_like_html_bytes(raw):
+            return {
+                "ok": False,
+                "error": "This response looks like HTML (often a login or site error), not a Word file. Try Download or re-sync.",
+            }
+        dx = _build_docx_preview(raw, ARTIFACT_TABLE_MAX_ROWS)
+        if dx.get("ok"):
+            return dx
         return {
             "ok": False,
-            "error": "Could not extract a ruled table from this PDF. Use Download to open the file.",
+            "error": str(dx.get("error") or "Could not preview Word (.docx)."),
         }
 
-    looks_xlsx = name.endswith((".xlsx", ".xlsm")) or "spreadsheet" in mt or "openxmlformats-officedocument" in mt
-    looks_xls = name.endswith(".xls") and not name.endswith(".xlsx")
+    looks_spreadsheet_mt = (
+        "spreadsheetml.sheet" in mt
+        or mt in ("application/vnd.ms-excel", "application/excel")
+        or ("spreadsheet" in mt and "wordprocessing" not in mt)
+    )
+    looks_xlsx_name = name.endswith((".xlsx", ".xlsm"))
+    excel_ooxml = _is_ooxlsx_workbook(raw)
 
-    if looks_xlsx or _is_ooxlsx_workbook(raw):
+    if (looks_xlsx_name or excel_ooxml or looks_spreadsheet_mt) and not _is_docx_ooxml(raw):
+        if _looks_like_html_bytes(raw):
+            return {
+                "ok": False,
+                "error": "This response looks like HTML (often a login or site error), not a spreadsheet file. Try Download or re-sync the artifact.",
+            }
         hdr, rows = _table_from_xlsx(
             raw,
             ARTIFACT_TABLE_MAX_ROWS,
@@ -1559,13 +1836,44 @@ def build_artifact_table_preview(
         )
         if hdr is not None and rows is not None:
             return {"ok": True, "columns": hdr, "rows": rows}
-        return {
-            "ok": False,
-            "error": "Could not read this spreadsheet (encrypted, corrupt, or missing openpyxl). Use Download.",
-        }
+        return _preview_message_grid(
+            [
+                "Spreadsheet parsing failed or this file is not actually Excel (.xlsx).",
+                "If it is Word, rename or re-download as .docx; otherwise open with Download.",
+            ],
+            preview_kind="spreadsheet_fallback",
+        )
 
+    looks_xls = name.endswith(".xls") and not name.endswith(".xlsx")
     if looks_xls:
-        return {"ok": False, "error": "Legacy .xls workbooks cannot be previewed in the app. Use Download."}
+        if _looks_like_html_bytes(raw):
+            return {
+                "ok": False,
+                "error": "This response looks like HTML (often a login or site error), not an Excel file. Try Download.",
+            }
+        xh, xr = _table_from_xlsx_calamine(
+            raw,
+            ARTIFACT_TABLE_MAX_ROWS,
+            min(200_000, ARTIFACT_TABLE_MAX_ROWS + 5000),
+        )
+        if xh is not None and xr is not None:
+            return {"ok": True, "columns": xh, "rows": xr}
+        return _preview_message_grid(
+            [
+                "Could not read legacy .xls as a sheet grid.",
+                "Use Download and open this file in Microsoft Excel.",
+            ],
+            preview_kind="xls_fallback",
+        )
+
+    if _looks_like_olecf(raw) and name.endswith(".doc"):
+        return _preview_message_grid(
+            [
+                "Legacy Microsoft Word (.doc) OLE format.",
+                "Use Download — tabular extraction is only supported for PDF, Excel/CSV, and modern .docx.",
+            ],
+            preview_kind="legacy_doc",
+        )
 
     looks_delimited = (
         name.endswith(".csv")
@@ -1612,4 +1920,22 @@ def build_artifact_table_preview(
             return {"ok": False, "error": "no_table"}
         return {"ok": True, "columns": tc, "rows": tb}
 
-    return {"ok": False, "error": "unsupported_type"}
+    textish = (
+        name.endswith((".txt", ".htm", ".html", ".xml", ".json", ".log"))
+        or mt in ("application/json", "application/xml")
+        or (mt.startswith("text/") and "html" not in mt)
+    )
+    if textish:
+        th = _try_text_line_preview(raw)
+        if th:
+            return th
+
+    fname_disp = (original_filename or "").strip() or "(unknown filename)"
+    return _preview_message_grid(
+        [
+            f"Stored file: {fname_disp}",
+            f"Reported MIME: {mt or 'application/octet-stream'}",
+            "No richer preview plug-in matched; use Download to open the original locally.",
+        ],
+        preview_kind="generic_fallback",
+    )

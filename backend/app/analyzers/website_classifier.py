@@ -76,7 +76,7 @@ def classify_website(page_access_result, page_structure):
         }
 
     # ================================
-    # C2: INTERACTIVE HTML
+    # C2: INTERACTIVE HTML (core cannot drive arbitrary UI yet — use app.portals adapters)
     # ================================
     if has_buttons or has_dropdowns or has_pagination:
         return {

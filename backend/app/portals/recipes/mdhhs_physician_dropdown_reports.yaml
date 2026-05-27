@@ -1,0 +1,16 @@
+# Illustrative recipe (MDHHS billing grids with select + View Report buttons).
+id: dropdown_submit_report_buttons__mdhhs_physicians
+strategy: playwright_dropdown_submit
+description: >-
+  Scans repeatable select widgets tied to localized View Report triggers; emits rows with `_links`.
+match:
+  host_contains: michigan.gov
+  path_contains: /billingreimbursement/physicians-practitioners-medical-clinics
+params:
+  button_text: View Report
+  settle_ms: 3200
+  navigation_timeout_ms: 65000
+  max_widgets: 40
+  max_options_per_widget: 35
+  headless: true
+  skip_option_substrings: []

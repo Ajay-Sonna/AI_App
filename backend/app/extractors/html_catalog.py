@@ -10,6 +10,12 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup, Tag
 
 from app.analyzers.structure_analyzer import infer_catalog_table_split, list_unique_tables
+from app.extractors.ca_dwc_omfs import (
+    annotate_ca_dwc_row_schedule_metadata,
+    infer_section_heading_before_table,
+    is_ca_dwc_portal,
+    table_looks_like_effective_date_documents,
+)
 
 
 def _split_header_and_body_rows(table: Tag) -> tuple[list[str], list[Tag]]:
@@ -253,6 +259,10 @@ def extract_deduped_table_catalog(
             "error": "header row looks unreliable (too many columns); try a different table",
         }
 
+    ca_dwc_section = ""
+    if is_ca_dwc_portal(base_url) and table_looks_like_effective_date_documents(columns):
+        ca_dwc_section = infer_section_heading_before_table(tables[table_index])
+
     rows_out: list[dict] = []
     for tr in body_trs:
         vals = _row_cell_texts(tr)
@@ -269,6 +279,11 @@ def extract_deduped_table_catalog(
             row["_links"] = links
         _hydrate_placeholder_file_cells(row, columns)
         rows_out.append(row)
+
+    if ca_dwc_section:
+        for row in rows_out:
+            if isinstance(row, dict):
+                annotate_ca_dwc_row_schedule_metadata(row, ca_dwc_section)
 
     return {"columns": columns, "rows": rows_out}
 

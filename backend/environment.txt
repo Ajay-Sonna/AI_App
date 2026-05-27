@@ -1,0 +1,22 @@
+# Pip dependencies (mirror of requirements.txt — use for quick copy or manual venv setup).
+# Install: pip install -r requirements.txt
+#
+# Note: use curl-cffi (Python TLS client with browser impersonation). The name is NOT "curl-c".
+
+groq
+requests
+beautifulsoup4
+PyYAML>=6
+python-dotenv
+fastapi
+python-multipart
+uvicorn[standard]
+pydantic
+playwright
+openpyxl
+python-calamine
+msoffcrypto-tool
+python-docx
+pdfplumber
+curl-cffi
+pyodbc

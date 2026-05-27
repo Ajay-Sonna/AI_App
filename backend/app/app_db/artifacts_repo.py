@@ -160,6 +160,42 @@ def recompute_is_current_for_state(*, state_code: Optional[str]) -> None:
             logger.warning("recompute failed for %s / %s: %s", sc, lsk, ex)
 
 
+def get_artifact_by_state_lsk_content_sha256(
+    *,
+    state_code: Optional[str],
+    logical_schedule_key: str,
+    content_sha256: str,
+) -> Optional[Dict[str, Any]]:
+    """Return newest row with same fingerprint for this folder (including historical).
+
+    Used to skip inserting another DB row when a re-fetch returns byte-identical content.
+    """
+    sc = _norm_state_code(state_code)
+    lsk = (logical_schedule_key or "").strip()[:256]
+    dg = (content_sha256 or "").strip()[:64]
+    if not lsk or not dg:
+        return None
+    sc_key = sc if sc else ""
+    with app_db_connect() as cx:
+        cur = cx.cursor()
+        cur.execute(
+            f"""
+            SELECT TOP (1) {_ARTIFACT_SELECT.strip()}
+            FROM dbo.fee_schedule_artifact
+            WHERE ISNULL(state_code, N'') = ?
+              AND logical_schedule_key = ?
+              AND content_sha256 = ?
+            ORDER BY artifact_id DESC
+            """,
+            (sc_key, lsk, dg),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        cols = [c[0] for c in cur.description]
+        return dict(zip(cols, row))
+
+
 def get_current_artifact_for_logical_key(
     *,
     state_code: Optional[str],

@@ -16,6 +16,7 @@ This avoids re-analysis, classification flip-flops, and pagination bugs.
 from __future__ import annotations
 from typing import Any, Dict, List
 
+from app.agents.catalog_link_llm import apply_llm_catalog_link_enrichment
 from app.agents.fee_document_normalize import apply_llm_fee_document_filter
 from app.agents.ingestion_agent import load_page_bundle
 from app.extractors.file_link_catalog import extract_file_link_catalog
@@ -23,8 +24,11 @@ from app.extractors.html_catalog import (
     extract_deduped_table_catalog,
     parse_table_block_index,
 )
+from app.config.settings import RUN_PAGINATION_WALL_SECONDS_DEFAULT
 from app.extractors.paginated_catalog import extract_table_catalog_paginated
 from app.extractors.servicenow_catalog import extract_servicenow_catalog
+from app.portals import collect_portal_catalog_extensions
+from app.portals.ga_mmis_postbacks import maybe_resolve_ga_mmis_postbacks
 from app.preview.session_store import (
     preview_authority_ttl_seconds,
     register_preview_authority,
@@ -37,6 +41,7 @@ def run_pipeline(
     paginate: bool = True,
     max_pages: int = 200,
     max_tables: int = 12,
+    pagination_wall_seconds: float | None = None,
 ) -> Dict[str, Any]:
     """
     Public, user-facing pipeline.
@@ -72,6 +77,12 @@ def run_pipeline(
             if len(rows) > 0:
                 return True
         return False
+
+    wall_s = (
+        float(pagination_wall_seconds)
+        if pagination_wall_seconds is not None
+        else float(RUN_PAGINATION_WALL_SECONDS_DEFAULT)
+    )
 
     spa_path = website_class == "C3_SPA_APP" or bool(bundle.get("spa_render_used"))
 
@@ -139,6 +150,7 @@ def run_pipeline(
                     url,
                     idx,
                     max_pages=max_pages,
+                    max_wall_seconds=wall_s,
                     fallback_html=html,
                     fallback_base=base,
                 )
@@ -158,6 +170,13 @@ def run_pipeline(
                 fc, fee_document_llm_meta = apply_llm_fee_document_filter(fc, base or url)
                 catalog_tables.append(fc)
 
+    # Interaction-gated portals: merge optional tables from registered adapters (see app.portals.registry).
+    portal_extra_tables, portal_adapters_meta = collect_portal_catalog_extensions(url, bundle)
+    if portal_extra_tables:
+        catalog_tables.extend(portal_extra_tables)
+
+    mmis_ga_resolve_meta = maybe_resolve_ga_mmis_postbacks(url, catalog_tables)
+
     # Drop empty ServiceNow placeholder when DOM/file extraction produced usable rows.
     if _tables_have_rows(catalog_tables) and len(catalog_tables) > 1:
         catalog_tables = [
@@ -165,6 +184,14 @@ def run_pipeline(
             for t in catalog_tables
             if len(t.get("rows") or []) > 0 or t.get("source") != "servicenow"
         ]
+
+    catalog_link_llm_meta: Dict[str, Any] | None = None
+    if _tables_have_rows(catalog_tables) and html:
+        catalog_link_llm_meta = apply_llm_catalog_link_enrichment(
+            str(html),
+            str(base or url or "").strip(),
+            catalog_tables,
+        )
 
     # --------------------------------------------------
     # 3) FINAL RESPONSE (FOR FRONTEND)
@@ -214,4 +241,10 @@ def run_pipeline(
         out["preview_auth"] = preview_auth_payload
     if fee_document_llm_meta is not None:
         out["fee_document_llm"] = fee_document_llm_meta
+    if catalog_link_llm_meta is not None:
+        out["catalog_link_llm"] = catalog_link_llm_meta
+    if portal_adapters_meta:
+        out["portal_adapters"] = portal_adapters_meta
+    if mmis_ga_resolve_meta.get("attempted_host") or mmis_ga_resolve_meta.get("eligible_mmis_ga_host"):
+        out["mmis_ga_postback_resolve"] = mmis_ga_resolve_meta
     return out

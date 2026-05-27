@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Set
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 from app.catalog.row_labels import (
+    compose_catalog_row_display_label,
     fee_schedule_title_from_row,
     guess_effective_date_from_link_text,
     guess_portal_date_str,
@@ -109,7 +110,7 @@ def collect_file_urls_from_pipeline_result(
     out: List[Dict[str, str]] = []
     base = (base_url or "").strip()
 
-    def _add(u: str, label: Optional[str], row: Dict[str, Any], table: Dict[str, Any]) -> None:
+    def _add(u: str, label: Optional[str], row: Dict[str, Any], table: Dict[str, Any], *, link: Optional[Dict[str, Any]] = None) -> None:
         u = (u or "").strip()
         if not u or u in seen:
             return
@@ -117,29 +118,61 @@ def collect_file_urls_from_pipeline_result(
             return
         seen.add(u)
         cols = ordered_column_names(table)
-        title = fee_schedule_title_from_row(row, cols) or (label or "").strip() or ""
-        if not title:
-            title = "fee_schedule"
-        lsk = slug_logical_schedule_key(title)
-        link_d = guess_effective_date_from_link_text((label or "").strip()) or ""
+        link_text = (label or "").strip()
+        row_title = fee_schedule_title_from_row(row, cols) or ""
+        fee_topic_slug = str(row.get("_fee_topic_slug") or "").strip()
+        link_d = guess_effective_date_from_link_text(link_text) or ""
         row_d = guess_portal_date_str(row, cols) or ""
         portal_date = link_d or row_d
+        display = compose_catalog_row_display_label(
+            row=row,
+            cols=cols,
+            portal_date_iso=portal_date.strip()[:10] if portal_date else None,
+            fallback_link_label=link_text or None,
+        )
         src = ""
         if link_d:
             src = "link_text"
         elif row_d:
             src = "row_cell"
-        superseded = row_or_label_superseded_hint(row=row, link_label=(label or ""))
-        out.append(
-            {
-                "url": u,
-                "label": (label or "")[:400],
-                "logical_schedule_key": lsk[:256],
-                "portal_date": portal_date[:32],
-                "effective_date_source": src[:32],
-                "superseded_hint": "1" if superseded else "",
-            }
-        )
+
+        if fee_topic_slug:
+            # One stable key per DWC section — do not derive from each document anchor.
+            lsk = fee_topic_slug[:256]
+        else:
+            lt_norm = link_text.strip().lower()
+            link_is_generic = lt_norm in ("", "download", "download file", "click here", "here", "file")
+            if row_title and link_is_generic:
+                lsk = slug_logical_schedule_key(row_title)
+            elif link_text and not link_is_generic:
+                lsk = slug_logical_schedule_key(link_text)
+            elif row_title:
+                lsk = slug_logical_schedule_key(row_title)
+            else:
+                lsk = slug_logical_schedule_key("fee_schedule")
+
+        superseded = row_or_label_superseded_hint(row=row, link_label=link_text)
+        if isinstance(link, dict) and str(link.get("superseded_hint") or "").strip() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            superseded = True
+        artifact_slot = ""
+        if isinstance(link, dict):
+            artifact_slot = str(link.get("_artifact_slot") or "").strip()[:32]
+        payload_entry: Dict[str, str] = {
+            "url": u,
+            "label": link_text[:400] if link_text else (row_title[:400] if row_title else "")[:400],
+            "catalog_display_label": (display.strip()[:512] if display.strip() else ""),
+            "logical_schedule_key": lsk[:256],
+            "portal_date": portal_date[:32],
+            "effective_date_source": src[:32],
+            "superseded_hint": "1" if superseded else "",
+        }
+        if artifact_slot:
+            payload_entry["artifact_slot"] = artifact_slot
+        out.append(payload_entry)
 
     for table in payload.get("catalog_tables") or []:
         if not isinstance(table, dict):
@@ -153,7 +186,7 @@ def collect_file_urls_from_pipeline_result(
                 raw = (link.get("url") or "").strip()
                 lab = (link.get("text") or link.get("label") or "")[:400]
                 u = _abs_url(base, raw)
-                _add(u, lab, row, table)
+                _add(u, lab, row, table, link=link if isinstance(link, dict) else None)
             for _k, val in row.items():
                 if isinstance(_k, str) and _k.startswith("_"):
                     continue
@@ -231,12 +264,30 @@ def summarize_artifact_link_availability(
                 postback_only_file_rows += 1
 
     user_message: Optional[str] = None
-    if catalog_file_like_rows and postback_only_file_rows and http_file_rows == 0:
+    ga_meta = payload.get("mmis_ga_postback_resolve")
+    ga_resolved = 0
+    if isinstance(ga_meta, dict):
+        try:
+            ga_resolved = int(ga_meta.get("urls_resolved") or 0)
+        except (TypeError, ValueError):
+            ga_resolved = 0
+
+    if ga_resolved > 0:
+        user_message = (
+            f"Browser replay resolved {ga_resolved} Georgia MMIS postback link(s) into direct HTTPS file URLs "
+            "(see mmis_ga_postback_resolve)."
+        )
+        if postback_only_file_rows:
+            user_message += (
+                f" About {postback_only_file_rows} catalog row(s) still look postback-only or were unmatched."
+            )
+
+    elif catalog_file_like_rows and postback_only_file_rows and http_file_rows == 0:
         user_message = (
             f"This portal lists {postback_only_file_rows} fee file row(s) that use ASP.NET postbacks "
             "(javascript:__doPostBack) instead of direct http(s) file links. "
-            "Auto-save cannot download those yet; open the portal and use each row’s download control, "
-            "or we can add a browser-based capture step for this pattern."
+            "For Georgia MMIS we can auto-resolve a bounded batch when GA_MMIS_POSTBACK_RESOLVE=true; "
+            "for other portals, open each download in the browser or add a portal adapter."
         )
     elif catalog_file_like_rows == 0 and not payload.get("blocked"):
         user_message = (

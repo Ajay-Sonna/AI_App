@@ -110,6 +110,39 @@ function artifactVersionStatusLabel(a) {
   return cur ? 'Latest' : 'Historical'
 }
 
+function artifactIsCurrent(a) {
+  return a?.is_current === true || a?.is_current === 1 || a?.is_current === '1'
+}
+
+/** Portal / stored labels that are not useful as a human title. */
+function isGarbageLinkArtifactLabel(s) {
+  const t = String(s || '')
+    .trim()
+    .toLowerCase()
+  return t === '' || t === 'download' || t === 'download file' || t === 'click here' || t === 'here' || t === 'file'
+}
+
+/** Edition timestamp: prefer portal effective date, else when we fetched (matches backend recompute). */
+function artifactEditionSortTs(a) {
+  const ped = a?.portal_effective_date
+  if (ped != null && ped !== '') {
+    try {
+      const d = new Date(String(ped).length === 10 ? `${ped}T12:00:00` : ped)
+      if (!Number.isNaN(d.getTime())) return d.getTime()
+    } catch {
+      /* ignore */
+    }
+  }
+  const ft = a?.fetched_at_utc
+  if (!ft) return 0
+  try {
+    const d2 = new Date(ft)
+    return Number.isNaN(d2.getTime()) ? 0 : d2.getTime()
+  } catch {
+    return 0
+  }
+}
+
 /** Single-line fee schedule title for saved artifacts (logical key preferred; no hashes/dates in the label). */
 function isLikelyStorageHash(stem) {
   const t = String(stem || '').trim()
@@ -193,7 +226,9 @@ function artifactFeeScheduleDisplayName(a) {
   const rawLogical = String(a.logical_schedule_key || '').trim().replace(/_/g, ' ')
   const slabel = String(a.source_label || '').trim()
   let base = ''
-  if (rawLogical && slabel && logicalLooksLikeAbbreviationSlug(rawLogical) && slabel.length > rawLogical.length + 2) {
+  if (slabel && !isGarbageLinkArtifactLabel(slabel)) {
+    base = slabel
+  } else if (rawLogical && slabel && logicalLooksLikeAbbreviationSlug(rawLogical) && slabel.length > rawLogical.length + 2) {
     base = slabel
   } else if (rawLogical) {
     base = rawLogical
@@ -408,6 +443,8 @@ const RUN_DEFAULTS = Object.freeze({
   paginate: true,
   max_pages: 50,
   max_tables: 12,
+  /** 0 = unlimited downloads for this run (backend); matches user expectation for “sync everything we found”. */
+  maxArtifactDownloads: 0,
 })
 
 /** Comma-separated column keys to omit from the table (e.g. sys_id). Set env VITE_HIDE_TABLE_COLUMNS to '' to hide nothing. */
@@ -435,6 +472,7 @@ const NAV = [
   { id: 'schedules', label: 'Fee Schedules', icon: 'layers' },
   { id: 'scheduleVersions', label: 'Schedule versions', icon: 'history' },
   { id: 'mapping', label: 'Mapping', icon: 'columns' },
+  { id: 'notifications', label: 'Notifications', icon: 'bell' },
   { id: 'stateUrls', label: 'State URLs', icon: 'link' },
   { id: 'compare', label: 'Compare', icon: 'compare' },
   { id: 'dst', label: 'DST Data', icon: 'database' },
@@ -499,6 +537,13 @@ function NavIcon({ name }) {
       return (
         <svg {...common}>
           <path d="M10 13a5 5 0 0 1 0-7l1-1a5 5 0 0 1 7 7l-1 1M14 11a5 5 0 0 1 0 7l-1 1a5 5 0 0 1-7-7l1-1" />
+        </svg>
+      )
+    case 'bell':
+      return (
+        <svg {...common}>
+          <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" />
+          <path d="M13.73 21a2 2 0 0 1-3.46 0" />
         </svg>
       )
     default:
@@ -1986,12 +2031,35 @@ export default function App() {
   const [mappingSavedMappingsError, setMappingSavedMappingsError] = useState(null)
   const [mappingSavedMappingsTick, setMappingSavedMappingsTick] = useState(0)
   const [mappingDeleteBusyId, setMappingDeleteBusyId] = useState(null)
+  /** Bulk import workbook (CSV / Xlsx) → fee-column-mappings upserts. */
+  const [mappingBulkBusy, setMappingBulkBusy] = useState(false)
+  const [mappingBulkDryRun, setMappingBulkDryRun] = useState(false)
+  const [mappingBulkClientError, setMappingBulkClientError] = useState(null)
+  const [mappingBulkApiResult, setMappingBulkApiResult] = useState(null)
+  const mappingBulkFileInputRef = useRef(null)
   /** Tracks mapping row backing the composer (for invalidation after delete). */
   const [mappingActiveMappingId, setMappingActiveMappingId] = useState(null)
   /** { loading?, error?, detail? } for read-only view */
   const [mappingShowModal, setMappingShowModal] = useState(null)
   /** State/DST selectors + pairing editor (opened from Saved mappings). */
   const [mappingComposerModalOpen, setMappingComposerModalOpen] = useState(false)
+  /** Per-state notification teams (companion DB); outbound mail not wired yet. */
+  const [notifContacts, setNotifContacts] = useState([])
+  const [notifContactsLoading, setNotifContactsLoading] = useState(false)
+  const [notifContactsError, setNotifContactsError] = useState(null)
+  const [notifContactsTick, setNotifContactsTick] = useState(0)
+  const [notifSaving, setNotifSaving] = useState(false)
+  const [notifFormError, setNotifFormError] = useState(null)
+  const [notifEditingId, setNotifEditingId] = useState(null)
+  const [notifFormName, setNotifFormName] = useState('')
+  const [notifFormEmail, setNotifFormEmail] = useState('')
+  const [notifFormTeam, setNotifFormTeam] = useState('')
+  const [notifFormDept, setNotifFormDept] = useState('')
+  const [notifFormEnabled, setNotifFormEnabled] = useState(true)
+  const [notifFormNewFile, setNotifFormNewFile] = useState(true)
+  const [notifFormCompare, setNotifFormCompare] = useState(true)
+  const [notifDeleteBusyId, setNotifDeleteBusyId] = useState(null)
+  const [notifTeamModalOpen, setNotifTeamModalOpen] = useState(false)
   /** Artifact dropdown: skip default /latest hydrate once (opening editor from saved list). */
   const mappingArtifactAutoLoadRef = useRef(true)
   const mappingSkipDstPairsFetchOnceRef = useRef(false)
@@ -2147,6 +2215,18 @@ export default function App() {
       setStateArtifactHistoryLoading(false)
     }
   }, [selectedStateCode])
+
+  const scheduleVersionsTableRows = useMemo(() => {
+    const rows = [...(Array.isArray(stateArtifactHistory) ? stateArtifactHistory : [])]
+    rows.sort((a, b) => {
+      const lkA = String(a?.logical_schedule_key || '').trim().toLowerCase()
+      const lkB = String(b?.logical_schedule_key || '').trim().toLowerCase()
+      const c = lkA.localeCompare(lkB, undefined, { sensitivity: 'base', numeric: true })
+      if (c !== 0) return c
+      return artifactEditionSortTs(b) - artifactEditionSortTs(a)
+    })
+    return rows
+  }, [stateArtifactHistory])
 
   useEffect(() => {
     if (activeNav !== 'scheduleVersions' || !selectedStateCode) return undefined
@@ -2340,6 +2420,72 @@ export default function App() {
       .finally(() => setMappingSavedMappingsLoading(false))
     return () => ac.abort()
   }, [activeNav, selectedStateCode, mappingSavedMappingsTick])
+
+  useEffect(() => {
+    if (activeNav !== 'mapping') {
+      setMappingBulkApiResult(null)
+      setMappingBulkClientError(null)
+      setMappingBulkBusy(false)
+    }
+  }, [activeNav])
+
+  useEffect(() => {
+    setMappingBulkApiResult(null)
+    setMappingBulkClientError(null)
+  }, [selectedStateCode])
+
+  useEffect(() => {
+    setNotifEditingId(null)
+    setNotifFormName('')
+    setNotifFormEmail('')
+    setNotifFormTeam('')
+    setNotifFormDept('')
+    setNotifFormEnabled(true)
+    setNotifFormNewFile(true)
+    setNotifFormCompare(true)
+    setNotifFormError(null)
+    setNotifDeleteBusyId(null)
+    setNotifTeamModalOpen(false)
+  }, [selectedStateCode])
+
+  useEffect(() => {
+    if (activeNav !== 'notifications') {
+      setNotifContacts([])
+      setNotifContactsLoading(false)
+      setNotifContactsError(null)
+      setNotifDeleteBusyId(null)
+      setNotifTeamModalOpen(false)
+      return undefined
+    }
+    if (!selectedStateCode) {
+      setNotifContacts([])
+      setNotifContactsLoading(false)
+      setNotifContactsError(null)
+      return undefined
+    }
+    const ac = new AbortController()
+    setNotifContactsLoading(true)
+    setNotifContactsError(null)
+    fetch(`${API_BASE}/app/notification-contacts?state_code=${encodeURIComponent(selectedStateCode)}`, {
+      signal: ac.signal,
+    })
+      .then(async (res) => {
+        if (!res.ok) throw new Error(await readHttpErrorMessage(res, `Load failed (${res.status})`))
+        return res.json()
+      })
+      .then((data) => {
+        const rows = Array.isArray(data?.contacts) ? data.contacts : []
+        setNotifContacts(rows)
+      })
+      .catch((e) => {
+        if (e.name !== 'AbortError') {
+          setNotifContacts([])
+          setNotifContactsError(e?.message || 'Could not load notification teams.')
+        }
+      })
+      .finally(() => setNotifContactsLoading(false))
+    return () => ac.abort()
+  }, [activeNav, selectedStateCode, notifContactsTick])
 
   const mappingArtifactIdFromKey = useMemo(() => {
     const m = (mappingStateFeeKey || '').match(/^a:(\d+)$/)
@@ -2564,6 +2710,52 @@ export default function App() {
   const bumpMappingSavedList = useCallback(() => {
     setMappingSavedMappingsTick((t) => t + 1)
   }, [])
+
+  const submitMappingBulkImport = useCallback(
+    async (e) => {
+      e.preventDefault()
+      setMappingBulkClientError(null)
+      setMappingBulkApiResult(null)
+      if (!selectedStateCode) {
+        setMappingBulkClientError('Pick a state in the sidebar.')
+        return
+      }
+      const inp = mappingBulkFileInputRef.current
+      const file = inp?.files?.[0]
+      if (!file?.name) {
+        setMappingBulkClientError('Choose a .csv or .xlsx file.')
+        return
+      }
+      const fd = new FormData()
+      fd.append('state_code', selectedStateCode)
+      fd.append('dry_run', mappingBulkDryRun ? 'true' : 'false')
+      fd.append('file', file, file.name)
+      setMappingBulkBusy(true)
+      try {
+        const res = await fetch(`${API_BASE}/app/fee-column-mappings/bulk-import`, {
+          method: 'POST',
+          body: fd,
+        })
+        const data = await res.json().catch(() => ({}))
+        if (!res.ok) {
+          const msg =
+            typeof data?.detail === 'string'
+              ? data.detail
+              : await readHttpErrorMessage(res, `Bulk import failed (${res.status})`)
+          throw new Error(msg)
+        }
+        setMappingBulkApiResult(data)
+        if (data?.ok && !data?.dry_run) bumpMappingSavedList()
+      } catch (err) {
+        if (err.name !== 'AbortError') {
+          setMappingBulkClientError(err?.message || 'Bulk import failed.')
+        }
+      } finally {
+        setMappingBulkBusy(false)
+      }
+    },
+    [selectedStateCode, mappingBulkDryRun, bumpMappingSavedList],
+  )
 
   const resetMappingComposerToIdle = useCallback(() => {
     mappingArtifactAutoLoadRef.current = true
@@ -3173,6 +3365,7 @@ export default function App() {
           paginate: RUN_DEFAULTS.paginate,
           max_pages: RUN_DEFAULTS.max_pages,
           max_tables: RUN_DEFAULTS.max_tables,
+          max_artifact_downloads: RUN_DEFAULTS.maxArtifactDownloads,
         }),
       })
       if (!res.ok) {
@@ -3218,6 +3411,15 @@ export default function App() {
       msg = `Last run: ${cand} file URL(s) queued; nothing new written (all skipped as unchanged, or no bytes saved).`
     } else {
       msg = `Last run: ${cand} URL(s) considered · saved ${wrote} new file(s), skipped ${skipped} unchanged, ${er.length} download error(s).`
+    }
+    if (typeof msg === 'string' && Number.isFinite(cand) && cand > 0) {
+      const attempts = Number(agentResult.artifact_download_attempts)
+      const trunc = Number(agentResult.artifact_download_truncated)
+      if (Number.isFinite(trunc) && trunc > 0) {
+        msg = `${msg} (${trunc} URL(s) not attempted — downloads capped; raise max_artifact_downloads or set ARTIFACT_DOWNLOAD_MAX_PER_RUN to 0 for unlimited.)`
+      } else if (Number.isFinite(attempts) && attempts >= 0 && attempts < cand) {
+        msg = `${msg} (Only ${attempts} of ${cand} discovered URL(s) were downloaded this run.)`
+      }
     }
     const pe = agentResult.artifacts_pruned_error
     if (pe) {
@@ -3314,6 +3516,7 @@ export default function App() {
 
   const pageTitle = useMemo(() => {
     if (activeNav === 'scheduleVersions') return 'Schedule versions'
+    if (activeNav === 'notifications') return 'Notifications'
     return 'Fee Schedules'
   }, [activeNav])
   const runCompare = useCallback(() => {
@@ -3401,6 +3604,136 @@ export default function App() {
     stateFeePickRows,
     dstTablePickOptions,
   ])
+
+  const saveNotificationContact = useCallback(
+    async (e) => {
+      e.preventDefault()
+      const sc = (selectedStateCode || '').trim()
+      if (!sc) return
+      const nm = notifFormName.trim()
+      const em = notifFormEmail.trim()
+      if (!nm || !em) {
+        setNotifFormError('Recipient name and email are required.')
+        return
+      }
+      setNotifSaving(true)
+      setNotifFormError(null)
+      try {
+        const body = {
+          state_code: sc,
+          contact_name: nm,
+          email: em,
+          team_name: notifFormTeam.trim() || null,
+          department_name: notifFormDept.trim() || null,
+          notifications_enabled: notifFormEnabled,
+          notify_new_state_file: notifFormNewFile,
+          notify_compare_result: notifFormCompare,
+        }
+        const path =
+          notifEditingId != null
+            ? `${API_BASE}/app/notification-contacts/${encodeURIComponent(String(notifEditingId))}`
+            : `${API_BASE}/app/notification-contacts`
+        const res = await fetch(path, {
+          method: notifEditingId != null ? 'PUT' : 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        })
+        if (!res.ok) throw new Error(await readHttpErrorMessage(res, `Save failed (${res.status})`))
+        setNotifContactsTick((t) => t + 1)
+        setNotifTeamModalOpen(false)
+        setNotifEditingId(null)
+        setNotifFormName('')
+        setNotifFormEmail('')
+        setNotifFormTeam('')
+        setNotifFormDept('')
+        setNotifFormEnabled(true)
+        setNotifFormNewFile(true)
+        setNotifFormCompare(true)
+      } catch (err) {
+        setNotifFormError(err?.message || 'Could not save this team.')
+      } finally {
+        setNotifSaving(false)
+      }
+    },
+    [
+      selectedStateCode,
+      notifEditingId,
+      notifFormName,
+      notifFormEmail,
+      notifFormTeam,
+      notifFormDept,
+      notifFormEnabled,
+      notifFormNewFile,
+      notifFormCompare,
+    ],
+  )
+
+  const cancelNotificationEdit = useCallback(() => {
+    setNotifFormError(null)
+    setNotifEditingId(null)
+    setNotifFormName('')
+    setNotifFormEmail('')
+    setNotifFormTeam('')
+    setNotifFormDept('')
+    setNotifFormEnabled(true)
+    setNotifFormNewFile(true)
+    setNotifFormCompare(true)
+    setNotifTeamModalOpen(false)
+  }, [])
+
+  const openAddNotificationTeamModal = useCallback(() => {
+    setNotifFormError(null)
+    setNotifEditingId(null)
+    setNotifFormName('')
+    setNotifFormEmail('')
+    setNotifFormTeam('')
+    setNotifFormDept('')
+    setNotifFormEnabled(true)
+    setNotifFormNewFile(true)
+    setNotifFormCompare(true)
+    setNotifTeamModalOpen(true)
+  }, [])
+
+  const deleteNotificationContactRow = useCallback(
+    async (cid) => {
+      const sc = (selectedStateCode || '').trim()
+      if (!sc || cid == null) return
+      setNotifDeleteBusyId(cid)
+      setNotifContactsError(null)
+      try {
+        const res = await fetch(
+          `${API_BASE}/app/notification-contacts/${encodeURIComponent(String(cid))}?state_code=${encodeURIComponent(sc)}`,
+          { method: 'DELETE' },
+        )
+        if (!res.ok) throw new Error(await readHttpErrorMessage(res, `Delete failed (${res.status})`))
+        if (notifEditingId === cid) {
+          cancelNotificationEdit()
+        }
+        setNotifContactsTick((t) => t + 1)
+      } catch (err) {
+        setNotifContactsError(err?.message || 'Could not remove this team.')
+      } finally {
+        setNotifDeleteBusyId(null)
+      }
+    },
+    [selectedStateCode, notifEditingId, cancelNotificationEdit],
+  )
+
+  const editNotificationContactRow = useCallback((row) => {
+    const id = Number(row?.notification_contact_id)
+    if (!Number.isFinite(id)) return
+    const apiBit = (v) => v === true || v === 1 || v === '1'
+    setNotifFormError(null)
+    setNotifEditingId(id)
+    setNotifFormName(String(row?.contact_name || ''))
+    setNotifFormEmail(String(row?.email || ''))
+    setNotifFormTeam(String(row?.team_name || ''))
+    setNotifFormDept(String(row?.department_name || ''))
+    setNotifFormEnabled(apiBit(row?.notifications_enabled))
+    setNotifFormNewFile(apiBit(row?.notify_new_state_file))
+    setNotifFormCompare(apiBit(row?.notify_compare_result))
+    setNotifTeamModalOpen(true)
+  }, [])
 
   const schedulesDashboardMetrics = useMemo(() => {
     void schedulesMetricsTick
@@ -3578,7 +3911,8 @@ export default function App() {
               </header>
 
               {selectedStateCode ? (
-                <section
+                <>
+                  <section
                   className="app-card app-mapping-inventory-card"
                   aria-labelledby="mapping-saved-title"
                   aria-busy={mappingSavedMappingsLoading ? 'true' : 'false'}
@@ -3667,6 +4001,120 @@ export default function App() {
                     </div>
                   ) : null}
                 </section>
+
+                <section
+                  className="app-card app-mapping-bulk-import-card"
+                  aria-labelledby="mapping-bulk-import-title"
+                  aria-busy={mappingBulkBusy ? 'true' : 'false'}
+                >
+                  <div className="app-card__head app-card__head--tight">
+                    <h3 id="mapping-bulk-import-title" className="app-card__title">
+                      Bulk import
+                    </h3>
+                  </div>
+                  <p className="app-muted app-mapping-bulk-import-hint">
+                    Upload CSV or Excel (first sheet). Required columns{' '}
+                    <code className="app-code-inline">StateSchedule</code> or{' '}
+                    <code className="app-code-inline">ArtifactId</code>,{' '}
+                    <code className="app-code-inline">DstSchedule</code>,{' '}
+                    <code className="app-code-inline">StateColumn</code>,{' '}
+                    <code className="app-code-inline">DstColumn</code>; optional{' '}
+                    <code className="app-code-inline">Action</code> (
+                    <code className="app-code-inline">replace</code> or{' '}
+                    <code className="app-code-inline">merge</code> — last row in each group wins). Rows that share the same
+                    schedule and DST target are merged into one saved mapping.
+                  </p>
+                  <form className="app-mapping-bulk-import-form" onSubmit={(e) => void submitMappingBulkImport(e)}>
+                    <div className="app-mapping-bulk-import-row">
+                      <input
+                        ref={mappingBulkFileInputRef}
+                        type="file"
+                        name="mapping_bulk_file"
+                        accept=".csv,.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv"
+                        className="app-input"
+                        disabled={mappingBulkBusy}
+                      />
+                    </div>
+                    <div className="app-mapping-bulk-import-row app-mapping-bulk-import-actions">
+                      <label className="app-field-label app-field-label--inline">
+                        <input
+                          type="checkbox"
+                          checked={mappingBulkDryRun}
+                          disabled={mappingBulkBusy}
+                          onChange={(e) => setMappingBulkDryRun(e.target.checked)}
+                        />{' '}
+                        Dry run (validate only)
+                      </label>
+                      <button type="submit" className="app-btn app-btn--primary" disabled={mappingBulkBusy}>
+                        {mappingBulkBusy ? 'Working…' : 'Run import'}
+                      </button>
+                    </div>
+                  </form>
+                  {mappingBulkClientError ? (
+                    <p className="app-error" role="alert">
+                      {mappingBulkClientError}
+                    </p>
+                  ) : null}
+                  {mappingBulkApiResult ? (
+                    <div className="app-mapping-bulk-import-result" role="status">
+                      {mappingBulkApiResult.error ? (
+                        <p className="app-error">{String(mappingBulkApiResult.error)}</p>
+                      ) : null}
+                      {mappingBulkApiResult.ok ? (
+                        <p className={mappingBulkApiResult.dry_run ? 'app-muted' : undefined}>
+                          {mappingBulkApiResult.dry_run
+                            ? `Dry run OK — ${(mappingBulkApiResult.applied || []).length} group(s) valid.`
+                            : `Saved ${(mappingBulkApiResult.applied || []).length} mapping group(s).`}
+                        </p>
+                      ) : !mappingBulkApiResult.error ? (
+                        <p className="app-error">Import finished with issues — see details below.</p>
+                      ) : null}
+                      {Array.isArray(mappingBulkApiResult.warnings) && mappingBulkApiResult.warnings.length > 0 ? (
+                        <div className="app-mapping-bulk-import-list">
+                          <strong>Warnings</strong>
+                          <ul>
+                            {mappingBulkApiResult.warnings.map((w, i) => (
+                              <li key={`mw-${i}`}>
+                                {w?.row != null ? `Row ${w.row}: ` : ''}
+                                {String(w?.message || w)}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      ) : null}
+                      {Array.isArray(mappingBulkApiResult.errors) && mappingBulkApiResult.errors.length > 0 ? (
+                        <div className="app-mapping-bulk-import-list">
+                          <strong>Errors</strong>
+                          <ul>
+                            {mappingBulkApiResult.errors.map((w, i) => (
+                              <li key={`me-${i}`}>
+                                {w?.row != null ? `Row ${w.row}: ` : ''}
+                                {String(w?.message || w)}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      ) : null}
+                      {Array.isArray(mappingBulkApiResult.applied) && mappingBulkApiResult.applied.length > 0 ? (
+                        <div className="app-mapping-bulk-import-list">
+                          <strong>Applied</strong>
+                          <ul>
+                            {mappingBulkApiResult.applied.map((a, i) => (
+                              <li key={`ma-${i}`}>
+                                artifact {a.artifact_id} →{' '}
+                                <code className="app-code-inline">{String(a.dst_fsname || '')}</code>
+                                {' — '}
+                                {Number(a.pairs) || 0} pair(s)
+                                {a.dry_run ? ' (dry run)' : a.mapping_id != null ? ` (mapping #${a.mapping_id})` : ''}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </section>
+                </>
               ) : null}
 
               {selectedStateCode && mappingMappingLoadError && !mappingComposerModalOpen ? (
@@ -4029,14 +4477,299 @@ export default function App() {
                 </div>
               ) : null}
             </>
+          ) : activeNav === 'notifications' ? (
+            <>
+              <header className="app-main__header app-main__header--notif-only">
+                <h2 className="app-main__title">Notifications</h2>
+              </header>
+
+              <div className="app-notif-page">
+                {!selectedStateCode ? (
+                  <p className="app-muted">Select a state in the sidebar to manage notification teams.</p>
+                ) : (
+                  <>
+                    <div className="app-notif-toolbar">
+                      <button
+                        type="button"
+                        className="app-btn app-btn--primary"
+                        disabled={notifContactsLoading}
+                        onClick={() => openAddNotificationTeamModal()}
+                      >
+                        Add new team
+                      </button>
+                      <button
+                        type="button"
+                        className="app-btn app-btn--secondary"
+                        disabled={notifContactsLoading}
+                        onClick={() => setNotifContactsTick((t) => t + 1)}
+                      >
+                        {notifContactsLoading ? 'Refreshing…' : 'Refresh'}
+                      </button>
+                    </div>
+
+                    <section
+                      className="app-notif-list"
+                      aria-labelledby="notif-list-heading"
+                      aria-busy={notifContactsLoading ? 'true' : 'false'}
+                    >
+                      <div className="app-notif-list__intro">
+                        <h3 id="notif-list-heading" className="app-notif-list__title">
+                          Notification teams
+                        </h3>
+                        <p className="app-notif-list__scope app-muted">
+                          <strong>{stateNameFromCode(selectedStateCode)}</strong> ({selectedStateCode}) — recipients subscribed for
+                          this state
+                        </p>
+                      </div>
+
+                      {notifContactsError ? (
+                        <p className="app-error app-notif-list__banner" role="alert">
+                          {notifContactsError}
+                        </p>
+                      ) : null}
+
+                      {!notifContactsError && notifContactsLoading ? (
+                        <p className="app-muted app-notif-list__banner" role="status">
+                          Loading notification teams…
+                        </p>
+                      ) : null}
+
+                      {!notifContactsError && !notifContactsLoading && notifContacts.length === 0 ? (
+                        <p className="app-muted app-notif-list__banner" role="status">
+                          No teams added yet. Use <strong>Add new team</strong> to subscribe recipients for this state.
+                        </p>
+                      ) : null}
+
+                      {!notifContactsLoading && !notifContactsError && notifContacts.length > 0 ? (
+                        <div className="app-table-scroll app-notif-list__scroll">
+                          <table className="app-data-table app-data-table--catalog">
+                            <thead>
+                              <tr>
+                                <th scope="col">Recipient name</th>
+                                <th scope="col">Email</th>
+                                <th scope="col">Team</th>
+                                <th scope="col">Department</th>
+                                <th scope="col">State changes</th>
+                                <th scope="col">Compared results</th>
+                                <th scope="col">Actions</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {notifContacts.map((row) => {
+                                const nid = Number(row.notification_contact_id)
+                                const busyDel = notifDeleteBusyId === nid
+                                return (
+                                  <tr key={`notif-${nid}`}>
+                                    <td>{String(row.contact_name || '').trim() || '—'}</td>
+                                    <td>
+                                      <code className="app-code-inline">{String(row.email || '').trim() || '—'}</code>
+                                    </td>
+                                    <td>{String(row.team_name || '').trim() || '—'}</td>
+                                    <td>{String(row.department_name || '').trim() || '—'}</td>
+                                    <td>{formatCellValue(row.notify_new_state_file)}</td>
+                                    <td>{formatCellValue(row.notify_compare_result)}</td>
+                                    <td>
+                                      <div className="app-notif-row-actions">
+                                        <button
+                                          type="button"
+                                          className="app-btn app-btn--secondary app-btn--sm"
+                                          disabled={busyDel || notifSaving}
+                                          onClick={() => editNotificationContactRow(row)}
+                                        >
+                                          Edit
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className="app-btn app-btn--secondary app-btn--sm"
+                                          disabled={busyDel || notifSaving}
+                                          onClick={() => void deleteNotificationContactRow(nid)}
+                                        >
+                                          {busyDel ? '…' : 'Remove'}
+                                        </button>
+                                      </div>
+                                    </td>
+                                  </tr>
+                                )
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      ) : null}
+                    </section>
+                  </>
+                )}
+              </div>
+
+              {notifTeamModalOpen && selectedStateCode ? (
+                <div className="app-modal-backdrop" role="presentation" onClick={() => cancelNotificationEdit()}>
+                  <div
+                    className="app-modal app-modal--notif-team"
+                    role="dialog"
+                    aria-modal="true"
+                    aria-labelledby="notif-team-modal-title"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <div className="app-modal__head">
+                      <h2 id="notif-team-modal-title" className="app-modal__title">
+                        {notifEditingId != null ? 'Edit notification team' : 'Add notification team'}
+                      </h2>
+                      <button
+                        type="button"
+                        className="app-modal__close"
+                        aria-label="Close"
+                        disabled={notifSaving}
+                        onClick={() => cancelNotificationEdit()}
+                      >
+                        ×
+                      </button>
+                    </div>
+                    <div className="app-modal__body">
+                      <form
+                        className="app-notif-form app-notif-form--modal"
+                        onSubmit={(e) => void saveNotificationContact(e)}
+                      >
+                        <div className="app-notif-form__grid" aria-label="Team details">
+                          <div className="app-notif-form__group">
+                            <label className="app-field-label" htmlFor="notif-modal-name">
+                              Recipient name
+                            </label>
+                            <input
+                              id="notif-modal-name"
+                              type="text"
+                              className="app-input app-input--lg"
+                              autoComplete="name"
+                              value={notifFormName}
+                              onChange={(e) => setNotifFormName(e.target.value)}
+                              disabled={notifSaving}
+                            />
+                          </div>
+                          <div className="app-notif-form__group">
+                            <label className="app-field-label" htmlFor="notif-modal-email">
+                              Email
+                            </label>
+                            <input
+                              id="notif-modal-email"
+                              type="email"
+                              className="app-input app-input--lg"
+                              autoComplete="email"
+                              spellCheck={false}
+                              value={notifFormEmail}
+                              onChange={(e) => setNotifFormEmail(e.target.value)}
+                              disabled={notifSaving}
+                            />
+                          </div>
+                          <div className="app-notif-form__group">
+                            <label className="app-field-label" htmlFor="notif-modal-team">
+                              Team{' '}
+                              <span className="app-muted" style={{ fontWeight: '400' }}>
+                                (optional)
+                              </span>
+                            </label>
+                            <input
+                              id="notif-modal-team"
+                              type="text"
+                              className="app-input app-input--lg"
+                              value={notifFormTeam}
+                              onChange={(e) => setNotifFormTeam(e.target.value)}
+                              disabled={notifSaving}
+                            />
+                          </div>
+                          <div className="app-notif-form__group">
+                            <label className="app-field-label" htmlFor="notif-modal-dept">
+                              Department{' '}
+                              <span className="app-muted" style={{ fontWeight: '400' }}>
+                                (optional)
+                              </span>
+                            </label>
+                            <input
+                              id="notif-modal-dept"
+                              type="text"
+                              className="app-input app-input--lg"
+                              value={notifFormDept}
+                              onChange={(e) => setNotifFormDept(e.target.value)}
+                              disabled={notifSaving}
+                            />
+                          </div>
+                        </div>
+
+                        <div
+                          className={`app-notif-form__simple-prefs${notifSaving ? ' app-notif-form__simple-prefs--disabled' : ''}`}
+                          role="group"
+                          aria-label="Alert preferences"
+                        >
+                          <div className="app-notif-form__pref-row">
+                            <span className="app-notif-form__pref-row-label" id="notif-modal-pref-state-lbl">
+                              State changes
+                            </span>
+                            <label className="app-notif-form__switch app-notif-form__switch--row">
+                              <input
+                                type="checkbox"
+                                className="app-notif-form__switch-input"
+                                checked={notifFormNewFile}
+                                disabled={notifSaving}
+                                onChange={(e) => setNotifFormNewFile(e.target.checked)}
+                                aria-labelledby="notif-modal-pref-state-lbl"
+                              />
+                              <span className="app-notif-form__switch-track" />
+                            </label>
+                          </div>
+                          <div className="app-notif-form__pref-row">
+                            <span className="app-notif-form__pref-row-label" id="notif-modal-pref-compare-lbl">
+                              Compared results
+                            </span>
+                            <label className="app-notif-form__switch app-notif-form__switch--row">
+                              <input
+                                type="checkbox"
+                                className="app-notif-form__switch-input"
+                                checked={notifFormCompare}
+                                disabled={notifSaving}
+                                onChange={(e) => setNotifFormCompare(e.target.checked)}
+                                aria-labelledby="notif-modal-pref-compare-lbl"
+                              />
+                              <span className="app-notif-form__switch-track" />
+                            </label>
+                          </div>
+                        </div>
+
+                        {notifFormError ? (
+                          <p className="app-error app-notif-form__feedback" role="alert">
+                            {notifFormError}
+                          </p>
+                        ) : null}
+
+                        <div className="app-notif-modal__footer">
+                          <button
+                            type="button"
+                            className="app-btn app-btn--secondary"
+                            disabled={notifSaving}
+                            onClick={() => cancelNotificationEdit()}
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            type="submit"
+                            className="app-btn app-btn--primary"
+                            disabled={notifSaving || !notifFormName.trim() || !notifFormEmail.trim()}
+                          >
+                            {notifSaving ? 'Saving…' : notifEditingId != null ? 'Save changes' : 'Save team'}
+                          </button>
+                        </div>
+                      </form>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+            </>
           ) : activeNav === 'scheduleVersions' ? (
             <>
               <header className="app-main__header">
                 <h2 className="app-main__title">Schedule versions</h2>
                 <p className="app-main__lede">
-                  All saved files for the selected state, ordered by fee schedule and <strong>effective date</strong>. Rows marked{' '}
-                  <strong>Latest</strong> match the short list on Fee Schedules (one current file per schedule family). Recompute runs
-                  after each sync so superseded links do not replace a newer order.
+                  Every saved download for the selected state, grouped by <strong>logical fee schedule</strong>. Within each group,
+                  rows are ordered by <strong>portal edition date</strong> when we have it (otherwise by fetch time)—newest at the
+                  top, older editions below (so you can see Jan&nbsp;5 after an update and still find Jan&nbsp;1 as{' '}
+                  <strong>Historical</strong>). Rows marked <strong>Latest</strong> match the Fee Schedules tab (one winner per
+                  schedule family after each sync).
                 </p>
               </header>
 
@@ -4065,7 +4798,7 @@ export default function App() {
                   <p className="app-error" role="alert">
                     {stateArtifactHistoryError}
                   </p>
-                ) : stateArtifactHistory.length === 0 ? (
+                ) : scheduleVersionsTableRows.length === 0 ? (
                   <p className="app-muted" role="status">
                     No saved files for this state yet. Run <strong>Sync now</strong> from the sidebar.
                   </p>
@@ -4085,7 +4818,7 @@ export default function App() {
                         </tr>
                       </thead>
                       <tbody>
-                        {stateArtifactHistory.map((a) => {
+                        {scheduleVersionsTableRows.map((a) => {
                           const aid = Number(a.artifact_id)
                           const sup =
                             a.is_superseded_hint === true ||

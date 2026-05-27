@@ -63,6 +63,88 @@ def pick_fee_schedule_name_column(cols: List[str]) -> Optional[str]:
     return cols[0]
 
 
+def pick_program_column(cols: List[str], fee_col: Optional[str]) -> Optional[str]:
+    """Column that names program / category / service line (not the fee-schedule-name column)."""
+    for c in cols:
+        if fee_col and c == fee_col:
+            continue
+        t = str(c).strip().lower()
+        if not t or t.startswith("_"):
+            continue
+        if re.search(r"\b(program|service category|service line|category|department|division)\b", t):
+            if "fee" in t and "schedule" in t:
+                continue
+            return c
+    if len(cols) >= 2 and fee_col and cols[0] != fee_col:
+        t0 = str(cols[0]).strip().lower()
+        if re.search(r"\b(program|service category|category)\b", t0):
+            return cols[0]
+    return None
+
+
+def format_portal_date_heading(iso_date: str) -> str:
+    """Turn ``YYYY-MM-DD`` into a short heading like ``Jan 5, 2026`` (no zero-padded day)."""
+    try:
+        y, m, d = iso_date.strip()[:10].split("-", 2)
+        dt = date(int(y), int(m), int(d))
+    except (ValueError, TypeError):
+        return iso_date.strip()[:10]
+    month = dt.strftime("%b")
+    day = int(dt.day)
+    return f"{month} {day}, {dt.year}"
+
+
+def compose_catalog_row_display_label(
+    *,
+    row: Dict[str, Any],
+    cols: List[str],
+    portal_date_iso: Optional[str],
+    fallback_link_label: Optional[str] = None,
+) -> str:
+    """
+    Human-facing label persisted as ``fee_schedule_artifact.source_label``.
+
+    Prefer ``Program — Fee schedule`` when both exist; otherwise one column or row title.
+    When a portal edition date is known, suffix `` — {abbrev date}`` so multiple dated rows distinguish.
+    """
+    fee_col = pick_fee_schedule_name_column(cols)
+    prog_col = pick_program_column(cols, fee_col)
+    fee = ""
+    prog = ""
+
+    if fee_col:
+        fee = _cell_text(row.get(fee_col))
+    if prog_col:
+        prog = _cell_text(row.get(prog_col))
+
+    if not fee:
+        fee = fee_schedule_title_from_row(row, cols)
+
+    base = ""
+    if prog and fee and prog.strip().lower() != fee.strip().lower():
+        base = f"{prog.strip()} — {fee.strip()}"
+    elif fee:
+        base = fee.strip()
+    elif prog:
+        base = prog.strip()
+    elif fallback_link_label and str(fallback_link_label).strip():
+        fb = str(fallback_link_label).strip()
+        if len(fb) > 48 or fb.lower().startswith(("http://", "https://")):
+            fb = ""
+        if fb and fb.lower() not in ("download", "download file", "click here", "here"):
+            base = fb
+    else:
+        base = ""
+
+    if portal_date_iso and str(portal_date_iso).strip():
+        iso = str(portal_date_iso).strip()[:10]
+        suf = format_portal_date_heading(iso)
+        if suf and suf.lower() not in base.lower():
+            base = f"{base} — {suf}" if base else suf
+
+    return base.strip()
+
+
 def _cell_text(val: Any) -> str:
     if val is None:
         return ""
@@ -74,6 +156,10 @@ def _cell_text(val: Any) -> str:
 
 
 def fee_schedule_title_from_row(row: Dict[str, Any], cols: List[str]) -> str:
+    # California DWC OMFS: heading before the table (e.g. "Pathology and clinical laboratory")
+    topic = _cell_text(row.get("_schedule_section"))
+    if topic:
+        return topic
     col = pick_fee_schedule_name_column(cols)
     if not col:
         return ""
@@ -82,7 +168,20 @@ def fee_schedule_title_from_row(row: Dict[str, Any], cols: List[str]) -> str:
 
 def guess_portal_date_str(row: Dict[str, Any], cols: List[str]) -> Optional[str]:
     """Return YYYY-MM-DD if a plausible portal date cell is found."""
-    hints = ("date", "effective", "posted", "updated", "revised", "modified")
+    hints = (
+        "date",
+        "effective",
+        "posted",
+        "updated",
+        "revised",
+        "modified",
+        "published",
+        "created",
+        "release",
+        "effective date",
+        "posted date",
+        "revision",
+    )
     for c in cols:
         t = str(c).lower()
         if not any(h in t for h in hints):
@@ -90,9 +189,26 @@ def guess_portal_date_str(row: Dict[str, Any], cols: List[str]) -> Optional[str]
         raw = _cell_text(row.get(c))
         if not raw:
             continue
-        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%Y/%m/%d"):
+        raw_clean = raw[:48].strip()
+        fmts_lens: List[tuple[str, Optional[int]]] = [
+            ("%Y-%m-%d", 10),
+            ("%m-%d-%Y %H:%M:%S", 19),
+            ("%m-%d-%Y %H:%M", 16),
+            ("%m-%d-%Y", 10),
+            ("%m/%d/%Y %H:%M:%S", 19),
+            ("%m/%d/%Y %H:%M", 16),
+            ("%m/%d/%Y", 10),
+            ("%m/%d/%y", 8),
+            ("%Y/%m/%d", 10),
+            ("%d-%m-%Y %H:%M:%S", 19),
+            ("%d-%m-%Y", 10),
+        ]
+        for fmt, n_chars in fmts_lens:
+            if n_chars is not None and len(raw_clean) < n_chars:
+                continue
+            snippet = raw_clean[:n_chars] if n_chars else raw_clean
             try:
-                d = datetime.strptime(raw[:32].strip(), fmt).date()
+                d = datetime.strptime(snippet, fmt).date()
                 return d.isoformat()
             except ValueError:
                 continue

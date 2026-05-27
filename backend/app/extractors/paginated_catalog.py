@@ -156,7 +156,7 @@ def extract_table_catalog_paginated(
     max_pages: int = 200,
     settle_ms: int = 6500,
     post_click_ms: int = 4500,
-    max_wall_seconds: float = 180.0,
+    max_wall_seconds: float = 90.0,
     fallback_html: str | None = None,
     fallback_base: str | None = None,
 ) -> dict:
