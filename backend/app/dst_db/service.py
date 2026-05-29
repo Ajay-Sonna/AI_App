@@ -23,10 +23,11 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 _DROPPED_SQL_COLUMNS = frozenset(
-    {"dst_row_id", "row_id", "state_code", "inserted_at"},
+    {"dst_row_id", "row_id", "state_code", "inserted_at", "fs_name"},
 )
 
 _TABLE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+_FS_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,256}$")
 
 _MAX_ROWS_CAP = 10_000
 _DEFAULT_ROW_LIMIT = 2_000
@@ -259,9 +260,32 @@ def validate_table_name(name: str) -> str:
     return n
 
 
+def validate_fs_name(name: str) -> str:
+    """Logical fee schedule id stored in ``fs_name`` (not a SQL table name)."""
+    n = (name or "").strip()
+    if not _FS_NAME_RE.fullmatch(n):
+        raise ValueError("Invalid fee schedule name (fs_name)")
+    return n
+
+
+def get_fee_schedule_table() -> str:
+    """Configured warehouse table holding all states' fee schedule rows."""
+    raw = (os.getenv("DST_FEE_SCHEDULE_TABLE") or "dst_fee_schedule_raw").strip()
+    return validate_table_name(raw)
+
+
+def _configured_fs_name_column_logical() -> str:
+    return (os.getenv("DST_FS_NAME_COLUMN") or "fs_name").strip().lower() or "fs_name"
+
+
 _STATE_CODE_COLUMN_Q = """
 SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
 WHERE TABLE_SCHEMA = N'dbo' AND TABLE_NAME = ? AND LOWER(COLUMN_NAME) = N'state_code'
+"""
+
+_FS_NAME_COLUMN_Q = """
+SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = N'dbo' AND TABLE_NAME = ? AND LOWER(COLUMN_NAME) = ?
 """
 
 
@@ -278,6 +302,67 @@ def _resolve_state_code_column(table: str) -> Optional[str]:
     with _connect() as cx:
         cur = cx.cursor()
         return _resolve_state_code_column_using(cur, t)
+
+
+def _resolve_fs_name_column_using(cur: Any, validated_table: str) -> Optional[str]:
+    logical = _configured_fs_name_column_logical()
+    cur.execute(_FS_NAME_COLUMN_Q, (validated_table, logical))
+    row = cur.fetchone()
+    return str(row[0]) if row else None
+
+
+def _resolve_fs_name_column(table: str) -> Optional[str]:
+    t = validate_table_name(table)
+    with _connect() as cx:
+        cur = cx.cursor()
+        return _resolve_fs_name_column_using(cur, t)
+
+
+def list_dst_fee_schedules(*, state_code: str) -> List[str]:
+    """
+    Distinct ``fs_name`` values for a state in the configured fee schedule table
+    (``DST_FEE_SCHEDULE_TABLE``, default ``dst_fee_schedule_raw``).
+    """
+    t = get_fee_schedule_table()
+    sc = (state_code or "").strip().upper()[:8]
+    if not sc:
+        return []
+    with _connect() as cx:
+        cur = cx.cursor()
+        sc_col = _resolve_state_code_column_using(cur, t)
+        fs_col = _resolve_fs_name_column_using(cur, t)
+        if not sc_col or not fs_col:
+            fs_logical = _configured_fs_name_column_logical()
+            missing: List[str] = []
+            if not sc_col:
+                missing.append("state_code")
+            if not fs_col:
+                missing.append(fs_logical)
+            hint = ""
+            if not fs_col and fs_logical == "fs_name":
+                hint = " If your column is named fsname, set DST_FS_NAME_COLUMN=fsname."
+            raise ValueError(
+                f"Fee schedule table dbo.{t} is missing column(s): {', '.join(missing)}.{hint}",
+            )
+        bracket_sc = f"[{sc_col.replace(']', ']]')}]"
+        bracket_fs = f"[{fs_col.replace(']', ']]')}]"
+        sql = f"""
+            SELECT DISTINCT {bracket_fs} AS _fs
+            FROM [dbo].[{t}]
+            WHERE {bracket_sc} = ?
+              AND {bracket_fs} IS NOT NULL
+              AND LTRIM(RTRIM(CAST({bracket_fs} AS NVARCHAR(512)))) <> N''
+            ORDER BY {bracket_fs}
+        """
+        cur.execute(sql, (sc,))
+        rows = cur.fetchall()
+    out: List[str] = []
+    for r in rows:
+        if r and r[0] is not None:
+            s = str(r[0]).strip()
+            if s:
+                out.append(s)
+    return out
 
 
 def _tables_with_state_code_column() -> List[str]:
@@ -362,19 +447,31 @@ def fetch_dst_table_rows(
     *,
     limit: int = _DEFAULT_ROW_LIMIT,
     state_code: Optional[str] = None,
+    fs_name: Optional[str] = None,
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
     t = validate_table_name(table)
     lim = max(1, min(int(limit), _MAX_ROWS_CAP))
 
     quoted = f"[dbo].[{t}]"
     sc_val = (state_code or "").strip().upper()[:8] or None
-    sc_col = _resolve_state_code_column(t) if sc_val else None
+    fs_val = validate_fs_name(fs_name) if (fs_name or "").strip() else None
 
+    sc_col = _resolve_state_code_column(t) if sc_val else None
+    fs_col = _resolve_fs_name_column(t) if fs_val else None
+
+    where_parts: List[str] = []
+    params: List[Any] = []
     if sc_col and sc_val:
-        # Identifier from INFORMATION_SCHEMA only — safe to bracket-quote.
         bracket_col = f"[{sc_col.replace(']', ']]')}]"
-        sql = f"SELECT TOP ({lim}) * FROM {quoted} WHERE {bracket_col} = ?"
-        params: List[Any] = [sc_val]
+        where_parts.append(f"{bracket_col} = ?")
+        params.append(sc_val)
+    if fs_col and fs_val:
+        bracket_fs = f"[{fs_col.replace(']', ']]')}]"
+        where_parts.append(f"{bracket_fs} = ?")
+        params.append(fs_val)
+
+    if where_parts:
+        sql = f"SELECT TOP ({lim}) * FROM {quoted} WHERE " + " AND ".join(where_parts)
     else:
         sql = f"SELECT TOP ({lim}) * FROM {quoted}"
         params = []

@@ -16,9 +16,12 @@ This avoids re-analysis, classification flip-flops, and pagination bugs.
 from __future__ import annotations
 from typing import Any, Dict, List
 
+import time
+
 from app.agents.catalog_link_llm import apply_llm_catalog_link_enrichment
 from app.agents.fee_document_normalize import apply_llm_fee_document_filter
 from app.agents.ingestion_agent import load_page_bundle
+from app.llm.groq_usage import get_groq_usage, reset_groq_usage
 from app.extractors.file_link_catalog import extract_file_link_catalog
 from app.extractors.html_catalog import (
     extract_deduped_table_catalog,
@@ -47,6 +50,8 @@ def run_pipeline(
     Public, user-facing pipeline.
     The frontend should call THIS function via a single endpoint.
     """
+    run_started = time.perf_counter()
+    reset_groq_usage()
 
     # --------------------------------------------------
     # 1) ANALYZE (ONCE)
@@ -58,6 +63,8 @@ def run_pipeline(
             "url": url,
             "blocked": True,
             "analysis": bundle.get("analysis"),
+            "run_duration_seconds": round(time.perf_counter() - run_started, 2),
+            "llm_token_usage": get_groq_usage().to_dict(),
         }
 
     website_class = bundle.get("website_class", {}).get("website_class")
@@ -247,4 +254,6 @@ def run_pipeline(
         out["portal_adapters"] = portal_adapters_meta
     if mmis_ga_resolve_meta.get("attempted_host") or mmis_ga_resolve_meta.get("eligible_mmis_ga_host"):
         out["mmis_ga_postback_resolve"] = mmis_ga_resolve_meta
+    out["run_duration_seconds"] = round(time.perf_counter() - run_started, 2)
+    out["llm_token_usage"] = get_groq_usage().to_dict()
     return out

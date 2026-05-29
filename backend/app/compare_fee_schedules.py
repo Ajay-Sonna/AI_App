@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app.app_db import fee_column_mappings_repo
 from app.app_db.artifacts_repo import get_artifact_by_id
-from app.dst_db.service import fetch_dst_table_rows, validate_table_name
+from app.dst_db.service import fetch_dst_table_rows, get_fee_schedule_table, validate_fs_name
 from app.preview.preview_service import build_artifact_table_preview
 from app.storage.artifact_download import resolve_artifact_path
 
@@ -71,6 +72,36 @@ def _modifier_join_pair_from_map(
     return None, None
 
 
+def _duplicate_code_keys(rows: List[Dict[str, Any]], code_col: str) -> set:
+    from collections import Counter
+
+    ct = Counter(_norm_key(r.get(code_col)) for r in rows if _norm_key(r.get(code_col)))
+    return {k for k, v in ct.items() if v > 1}
+
+
+def _modifiers_disambiguate_duplicates(
+    rows: List[Dict[str, Any]],
+    code_col: str,
+    mod_col: Optional[str],
+) -> bool:
+    """True when duplicate codes have more than one distinct normalized modifier value."""
+    if not mod_col:
+        return False
+    from collections import Counter, defaultdict
+
+    ct = Counter(_norm_key(r.get(code_col)) for r in rows if _norm_key(r.get(code_col)))
+    dup_codes = {k for k, v in ct.items() if v > 1}
+    if not dup_codes:
+        return False
+    mods_by_code: Dict[str, set] = defaultdict(set)
+    for r in rows:
+        c = _norm_key(r.get(code_col))
+        if c not in dup_codes:
+            continue
+        mods_by_code[c].add(_norm_key(r.get(mod_col)))
+    return any(len(mods) > 1 for mods in mods_by_code.values())
+
+
 def _rows_to_dicts(columns: List[str], rows: List[List[Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for line in rows:
@@ -123,6 +154,14 @@ def _coerce_compare(
 ) -> Tuple[bool, str, str]:
     """Return (same, display_a, display_b)."""
     sa, sb = _norm_text(a), _norm_text(b)
+    da, db = _parse_date_only(a), _parse_date_only(b)
+    if da is not None and db is not None:
+        ds_a, ds_b = da.isoformat(), db.isoformat()
+        return da == db, ds_a, ds_b
+    if da is not None:
+        sa = da.isoformat()
+    if db is not None:
+        sb = db.isoformat()
     if sa == sb:
         return True, sa, sb
     fa = _try_decimal(sa)
@@ -150,10 +189,48 @@ def _try_decimal(s: str) -> Optional[Decimal]:
         return None
 
 
+_DATE_ONLY_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})$")
+_DATETIME_PREFIX_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})[ T]")
+
+
+def _parse_date_only(v: Any) -> Optional[date]:
+    """Extract calendar date from datetime/date objects or date/datetime strings."""
+    if v is None or v is False:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    s = str(v).strip()
+    if not s:
+        return None
+    m = _DATE_ONLY_RE.match(s)
+    if m:
+        try:
+            return date.fromisoformat(m.group(1))
+        except ValueError:
+            return None
+    m = _DATETIME_PREFIX_RE.match(s)
+    if m:
+        try:
+            return date.fromisoformat(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def _format_date_only(v: Any) -> Optional[str]:
+    d = _parse_date_only(v)
+    return d.isoformat() if d is not None else None
+
+
 def _display_val(v: Any) -> str:
     """Normalize cell values for JSON + UI tables."""
     if v is None:
         return ""
+    formatted_date = _format_date_only(v)
+    if formatted_date is not None:
+        return formatted_date
     if isinstance(v, Decimal):
         s = format(v, "f").rstrip("0").rstrip(".")
         return s if s else "0"
@@ -163,11 +240,6 @@ def _display_val(v: Any) -> str:
         if isinstance(v, float) and v != v:
             return ""
         return str(v)
-    if hasattr(v, "isoformat"):
-        try:
-            return v.isoformat()
-        except Exception:
-            pass
     return str(v).strip()
 
 
@@ -222,7 +294,8 @@ def compare_artifact_to_dst(
     sc = str(state_code or "").strip().upper()[:8]
     if not sc:
         raise ValueError("state_code is required")
-    dt = validate_table_name(dst_fsname)
+    dt = validate_fs_name(dst_fsname)
+    raw_table = get_fee_schedule_table()
 
     row_art = get_artifact_by_id(int(artifact_id))
     if not row_art:
@@ -239,7 +312,7 @@ def compare_artifact_to_dst(
     )
     if not map_row:
         raise ValueError(
-            f"No column mapping found for this file and DST table {dt}. Save a mapping on the Mapping tab."
+            f"No column mapping found for this file and DST fee schedule {dt}. Save a mapping on the Mapping tab."
         )
     column_map = _parse_column_map(map_row.get("column_map_json"))
     if not column_map:
@@ -272,13 +345,27 @@ def compare_artifact_to_dst(
         raise ValueError(str(grid.get("error") or "Could not parse artifact as a table"))
     st_cols: List[str] = [str(c) for c in grid["columns"]]
     st_rows_raw: List[List[Any]] = grid["rows"]
-    for req in (code_state_col, mod_preview_state_col):
-        if req and req not in st_cols:
-            raise ValueError(f"State side has no column “{req}” from the saved mapping (file headers may have changed).")
+    if code_state_col not in st_cols:
+        raise ValueError(
+            f"State side has no column “{code_state_col}” from the saved mapping (file headers may have changed). "
+            "Update the mapping on the Mapping tab."
+        )
+
+    mapping_warnings: List[str] = []
+    for st_col in column_map:
+        if st_col not in st_cols and st_col != code_state_col:
+            mapping_warnings.append(
+                f'State column "{st_col}" from saved mapping not found in current file — verify or update mapping.'
+            )
 
     st_dicts = _rows_to_dicts(st_cols, st_rows_raw)
 
-    dst_cols_tuple, dst_dicts = fetch_dst_table_rows(dt, limit=int(dst_row_limit), state_code=sc)
+    dst_cols_tuple, dst_dicts = fetch_dst_table_rows(
+        raw_table,
+        limit=int(dst_row_limit),
+        state_code=sc,
+        fs_name=dt,
+    )
 
     def pick_dst_col(name: str) -> Optional[str]:
         """Resolve physical column name on DST row (case-insensitive)."""
@@ -303,6 +390,8 @@ def compare_artifact_to_dst(
 
     ordered_pair_specs: List[Tuple[str, str]] = []
     for st_col, dst_targ in column_map.items():
+        if st_col not in st_cols:
+            continue
         phys = pick_dst_col(dst_targ)
         if phys:
             ordered_pair_specs.append((st_col, phys))
@@ -328,7 +417,7 @@ def compare_artifact_to_dst(
             )
         return out
 
-    # Decide join mode: duplicate code on either side → use code+modifier when MOD mapped.
+    # Duplicate codes → CODE+MOD join only when modifiers vary; else CODE in file order.
     dst_code_col = pick_dst_col("CODE")
     if not dst_code_col:
         raise ValueError("DST result set has no CODE column for joining.")
@@ -338,13 +427,18 @@ def compare_artifact_to_dst(
     st_ct = Counter(_norm_key(r.get(code_state_col)) for r in st_dicts if _norm_key(r.get(code_state_col)))
     dst_ct = Counter(_norm_key(r.get(dst_code_col)) for r in dst_dicts if _norm_key(r.get(dst_code_col)))
     dup_code = any(v > 1 for v in st_ct.values()) or any(v > 1 for v in dst_ct.values())
-    use_mod = bool(dup_code)
-    if use_mod:
-        if not mod_state_col or not mod_dst_col:
-            raise ValueError(
-                "The same procedure code appears on multiple rows. Map one state modifier column to "
-                "DST MOD (or MOD 1, MOD 2, …) and retry, or narrow the data so codes are unique."
-            )
+    state_mod_dis = _modifiers_disambiguate_duplicates(st_dicts, code_state_col, mod_state_col)
+    dst_mod_dis = _modifiers_disambiguate_duplicates(dst_dicts, dst_code_col, mod_dst_col)
+    use_mod = bool(dup_code and (state_mod_dis or dst_mod_dis))
+    if use_mod and (not mod_state_col or not mod_dst_col):
+        raise ValueError(
+            "The same procedure code appears on multiple rows with different modifiers. Map one state "
+            "modifier column to DST MOD (or MOD 1, MOD 2, …) and retry."
+        )
+    if dup_code and not use_mod:
+        mapping_warnings.append(
+            "Duplicate procedure codes with empty or identical modifiers — rows matched on CODE in file order."
+        )
 
     def join_key_state(r: Dict[str, Any]) -> Tuple[str, ...]:
         c = _norm_key(r.get(code_state_col))
@@ -358,14 +452,13 @@ def compare_artifact_to_dst(
             return (c, _norm_key(r.get(mod_dst_col)))
         return (c,)
 
-    dst_by_key: Dict[Tuple[str, ...], List[Dict[str, Any]]] = {}
+    dst_queues: Dict[Tuple[str, ...], List[Dict[str, Any]]] = {}
     for r in dst_dicts:
         k = join_key_dst(r)
         if not k or not k[0]:
             continue
-        dst_by_key.setdefault(k, []).append(r)
+        dst_queues.setdefault(k, []).append(r)
 
-    matched_dst_keys: set = set()
     mismatch_n = 0
     state_only_n = 0
     match_n = 0
@@ -380,8 +473,8 @@ def compare_artifact_to_dst(
         k = join_key_state(sr)
         if not k or not k[0]:
             continue
-        dst_matches = dst_by_key.get(k) or []
-        if not dst_matches:
+        queue = dst_queues.get(k) or []
+        if not queue:
             state_only_n += 1
             fds = build_field_diffs(sr, None)
             state_only_rows.append(
@@ -397,8 +490,7 @@ def compare_artifact_to_dst(
                 }
             )
             continue
-        dr = dst_matches[0]
-        matched_dst_keys.add(tuple(k))
+        dr = queue.pop(0)
         match_n += 1
         field_diffs = build_field_diffs(sr, dr)
         all_same = all(x["same"] for x in field_diffs) if field_diffs else True
@@ -420,24 +512,22 @@ def compare_artifact_to_dst(
         else:
             match_rows.append(row_obj)
 
-    # DST-only keys
-    for k, group in dst_by_key.items():
-        if k in matched_dst_keys:
-            continue
+    # DST-only rows left in queues after state rows consumed matches in order.
+    for k, queue in dst_queues.items():
         if not k or not k[0]:
             continue
-        dst_only_n += len(group)
-        dr = group[0]
-        fds = build_field_diffs(None, dr)
-        dst_only_rows.append(
-            {
-                "status": "dst_only",
-                "join_key": {"code": dr.get(dst_code_col), "modifier": dr.get(mod_dst_col) if use_mod else None},
-                "field_diffs": fds,
-                "state_row": {},
-                "dst_row": _row_display(dr),
-            }
-        )
+        for dr in queue:
+            dst_only_n += 1
+            fds = build_field_diffs(None, dr)
+            dst_only_rows.append(
+                {
+                    "status": "dst_only",
+                    "join_key": {"code": dr.get(dst_code_col), "modifier": dr.get(mod_dst_col) if use_mod else None},
+                    "field_diffs": fds,
+                    "state_row": {},
+                    "dst_row": _row_display(dr),
+                }
+            )
 
     _lm = len(mismatch_rows)
     _ls = len(state_only_rows)
@@ -454,7 +544,11 @@ def compare_artifact_to_dst(
     result_rows_capped = total_possible > len(out_rows)
 
     summary = {
-        "join_mode": "code_and_modifier" if use_mod else "code",
+        "join_mode": (
+            "code_and_modifier"
+            if use_mod
+            else ("code_sequential" if dup_code else "code")
+        ),
         "mapped_field_count": len(column_map),
         "state_row_count": len(st_dicts),
         "dst_row_count": len(dst_dicts),
@@ -478,6 +572,7 @@ def compare_artifact_to_dst(
         "dst_fsname": dt,
         "logical_schedule_key": lsk,
         "summary": summary,
+        "mapping_warnings": mapping_warnings,
         "mapping_dst_to_state": inverted,
         "column_pairs": column_pairs,
         "rows": out_rows,

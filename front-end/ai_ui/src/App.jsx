@@ -85,13 +85,35 @@ function stateNameFromCode(code) {
   return US_STATE_NAMES_BY_CODE[c] || c || '—'
 }
 
-function formatArtifactFetchedAt(iso) {
+/** All user-visible wall-clock timestamps use India Standard Time. */
+const APP_DISPLAY_TIME_ZONE = 'Asia/Kolkata'
+const APP_DISPLAY_LOCALE = 'en-IN'
+
+function parseApiUtcIso(iso) {
+  if (iso == null || iso === '') return null
+  const s = String(iso).trim()
+  if (!s) return null
+  if (/[zZ]$/.test(s) || /[+-]\d{2}:\d{2}$/.test(s)) return new Date(s)
+  return new Date(`${s}Z`)
+}
+
+function formatDateTimeIST(iso) {
   if (!iso) return '—'
   try {
-    return new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+    const d = parseApiUtcIso(iso)
+    if (!d || Number.isNaN(d.getTime())) return '—'
+    return `${d.toLocaleString(APP_DISPLAY_LOCALE, {
+      timeZone: APP_DISPLAY_TIME_ZONE,
+      dateStyle: 'medium',
+      timeStyle: 'short',
+    })} IST`
   } catch {
-    return String(iso)
+    return '—'
   }
+}
+
+function formatArtifactFetchedAt(iso) {
+  return formatDateTimeIST(iso)
 }
 
 function formatPortalEffectiveDateShort(iso) {
@@ -136,8 +158,8 @@ function artifactEditionSortTs(a) {
   const ft = a?.fetched_at_utc
   if (!ft) return 0
   try {
-    const d2 = new Date(ft)
-    return Number.isNaN(d2.getTime()) ? 0 : d2.getTime()
+    const d2 = parseApiUtcIso(ft)
+    return d2 && !Number.isNaN(d2.getTime()) ? d2.getTime() : 0
   } catch {
     return 0
   }
@@ -316,24 +338,28 @@ function buildArtifactFeePickRows(artifacts) {
   return list
 }
 
-/** Full timestamp for “last run” under the state name. */
+/** Full timestamp for “last run” under the state name (IST). */
 function formatPortalLastRunAt(iso) {
-  if (!iso) return '—'
-  try {
-    const d = new Date(iso)
-    if (Number.isNaN(d.getTime())) return '—'
-    return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
-  } catch {
-    return '—'
-  }
+  return formatDateTimeIST(iso)
+}
+
+function formatLlmTokenUsageSummary(usage) {
+  if (!usage || typeof usage !== 'object') return null
+  const input = Number(usage.prompt_tokens) || 0
+  const output = Number(usage.completion_tokens) || 0
+  const total = Number(usage.total_tokens) || input + output
+  const calls = Number(usage.call_count) || 0
+  if (total <= 0 && input <= 0 && output <= 0) return null
+  return `Groq tokens — input: ${input.toLocaleString(APP_DISPLAY_LOCALE)}, output: ${output.toLocaleString(APP_DISPLAY_LOCALE)}, total: ${total.toLocaleString(APP_DISPLAY_LOCALE)}${calls ? ` (${calls} LLM call${calls === 1 ? '' : 's'})` : ''}.`
 }
 
 /** Short relative time for dashboard cards (e.g. "2 mins ago"). */
 function formatRelativeAgo(iso) {
   if (!iso) return '—'
   try {
-    const t = new Date(iso).getTime()
-    if (Number.isNaN(t)) return '—'
+    const d = parseApiUtcIso(iso)
+    const t = d?.getTime()
+    if (t == null || Number.isNaN(t)) return '—'
     const sec = Math.max(0, Math.floor((Date.now() - t) / 1000))
     if (sec < 45) return 'Just now'
     const min = Math.floor(sec / 60)
@@ -1225,8 +1251,8 @@ function downloadFeeCompareWorkbook(baseName, result, rowsSubset) {
   triggerXlsxDownload(baseName, wb)
 }
 
-function dstSchedulesPreviewCacheKey(stateCode, table) {
-  return `${(stateCode || '').trim().toUpperCase() || '-'}::${table}`
+function dstSchedulesPreviewCacheKey(stateCode, fsName) {
+  return `${(stateCode || '').trim().toUpperCase() || '-'}::${fsName}`
 }
 
 function trimSchedulesPreviewMap(map, maxSize) {
@@ -1338,8 +1364,8 @@ async function fetchSchedulesArtifactPreview(id, artifacts, signal) {
   )
 }
 
-async function fetchDstSchedulesPreviewRows(table, stateCode, signal) {
-  const q = new URLSearchParams({ table, limit: '5000' })
+async function fetchDstSchedulesPreviewRows(rawTable, fsName, stateCode, signal) {
+  const q = new URLSearchParams({ table: rawTable, limit: '5000', fs_name: fsName })
   if (stateCode) q.set('state_code', stateCode)
   const res = await fetch(`${API_BASE}/dst/rows?${q}`, { signal })
   if (!res.ok) throw new Error(await readHttpErrorMessage(res, `Rows failed (${res.status})`))
@@ -1705,6 +1731,40 @@ function snapshotCompareForRecentHistory(fullResult, context) {
   }
 }
 
+function mapCompareRunApiRow(row) {
+  if (!row || typeof row !== 'object') return null
+  const summary = row.summary && typeof row.summary === 'object' ? row.summary : {}
+  const cid = Number(row.compare_run_id)
+  if (!Number.isFinite(cid)) return null
+  return {
+    id: String(cid),
+    compareRunId: cid,
+    at: row.compared_at_utc || '',
+    stateCode: String(row.state_code || '').toUpperCase(),
+    artifactId: Number(row.artifact_id) || null,
+    artifactLabel: String(row.artifact_label || row.logical_schedule_key || '').trim() || '—',
+    dstFsname: String(row.dst_fsname || '').trim(),
+    triggerSource: String(row.trigger_source || 'manual').toLowerCase(),
+    status: String(row.status || '').toLowerCase(),
+    hasWorkbook: row.has_workbook === true,
+    hasSnapshot: row.has_snapshot === true,
+    errorMessage: String(row.error_message || '').trim(),
+    summary,
+    matchPct: feeCompareJoinedMatchPct(summary),
+  }
+}
+
+function cacheCompareReplayPayload(replay, cacheRef) {
+  if (!replay || typeof replay !== 'object' || !cacheRef?.current) return
+  const id = Number(replay.compare_run_id)
+  if (!Number.isFinite(id) || id <= 0) return
+  cacheRef.current.set(id, replay)
+  while (cacheRef.current.size > 40) {
+    const first = cacheRef.current.keys().next().value
+    cacheRef.current.delete(first)
+  }
+}
+
 function recentCompareEntryToResult(entry) {
   if (!entry || typeof entry !== 'object') return null
   return {
@@ -1867,6 +1927,16 @@ function FeeScheduleComparePanel({ result }) {
 
   return (
     <div className="app-fee-compare-flow">
+      {Array.isArray(result?.mapping_warnings) && result.mapping_warnings.length > 0 ? (
+        <div className="app-fee-compare-mapping-warn" role="status">
+          <strong>Mapping review suggested</strong>
+          <ul>
+            {result.mapping_warnings.map((w, i) => (
+              <li key={`mw-${i}`}>{String(w)}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
       <div className="app-fee-compare-summary">
         <div className="app-fee-compare-summary-stats">
           {matchPct != null ? (
@@ -1945,6 +2015,11 @@ export default function App() {
   const [dstTables, setDstTables] = useState([])
   const [dstTablesLoading, setDstTablesLoading] = useState(false)
   const [dstTablesError, setDstTablesError] = useState(null)
+  /** Distinct ``fs_name`` values for sidebar state (from configured raw DST table). */
+  const [dstFeeSchedules, setDstFeeSchedules] = useState([])
+  const [dstFeeScheduleTable, setDstFeeScheduleTable] = useState('')
+  const [dstFeeSchedulesLoading, setDstFeeSchedulesLoading] = useState(false)
+  const [dstFeeSchedulesError, setDstFeeSchedulesError] = useState(null)
   const [dstSelectedTable, setDstSelectedTable] = useState('')
   const [dstColumns, setDstColumns] = useState([])
   const [dstRows, setDstRows] = useState([])
@@ -1976,6 +2051,8 @@ export default function App() {
   const [urlFormPortalUrl, setUrlFormPortalUrl] = useState('')
   const [portalEditorLinkId, setPortalEditorLinkId] = useState(null)
   const stateArtifactTablePreviewCacheRef = useRef(new Map())
+  /** In-memory replay payloads keyed by compare_run_id (instant View without refetch). */
+  const compareReplayCacheRef = useRef(new Map())
   const dstSchedulesPreviewCacheRef = useRef(new Map())
   /** Snapshot at Preview click — filter modal rows to the same slice as Export when a start date is chosen. */
   const schedulesDstPreviewFilterStartRef = useRef('')
@@ -1997,12 +2074,17 @@ export default function App() {
   const [schedulesDstFeeModalOpen, setSchedulesDstFeeModalOpen] = useState(false)
   const [schedulesCompareOpen, setSchedulesCompareOpen] = useState(false)
   const [schedulesCompareLoading, setSchedulesCompareLoading] = useState(false)
+  /** Loading saved snapshot from DB (eye icon) — not a live compare run. */
+  const [schedulesCompareReplayLoading, setSchedulesCompareReplayLoading] = useState(false)
   const [schedulesCompareError, setSchedulesCompareError] = useState(null)
   const [schedulesCompareResult, setSchedulesCompareResult] = useState(null)
   /** Invalidates schedules dashboard metrics (localStorage) after a successful compare. */
   const [schedulesMetricsTick, setSchedulesMetricsTick] = useState(0)
-  /** Bumps after push to recent-compares storage so the home card refreshes. */
+  /** Bumps after compare persisted (manual or sync) so Recent comparisons refreshes from API. */
   const [schedulesRecentComparesTick, setSchedulesRecentComparesTick] = useState(0)
+  const [compareRunsRows, setCompareRunsRows] = useState([])
+  const [compareRunsLoading, setCompareRunsLoading] = useState(false)
+  const [compareRunsError, setCompareRunsError] = useState(null)
   /** State fee dropdown key (`a:id`, catalog row key, …) — independent from DST selection. */
   const [schedulesStateFeeKey, setSchedulesStateFeeKey] = useState('')
   /** DST fee dropdown key (`d:table`) — independent from State selection. */
@@ -2037,6 +2119,8 @@ export default function App() {
   const [mappingBulkClientError, setMappingBulkClientError] = useState(null)
   const [mappingBulkApiResult, setMappingBulkApiResult] = useState(null)
   const mappingBulkFileInputRef = useRef(null)
+  const [mappingBulkScheduleNames, setMappingBulkScheduleNames] = useState([])
+  const [mappingBulkScheduleNamesLoading, setMappingBulkScheduleNamesLoading] = useState(false)
   /** Tracks mapping row backing the composer (for invalidation after delete). */
   const [mappingActiveMappingId, setMappingActiveMappingId] = useState(null)
   /** { loading?, error?, detail? } for read-only view */
@@ -2338,15 +2422,15 @@ export default function App() {
       setMappingDstColumnsError(null)
       return undefined
     }
-    const table = (mappingDstTable || '').trim()
-    if (!table) {
+    const fsName = (mappingDstTable || '').trim()
+    if (!fsName || !dstFeeScheduleTable) {
       setMappingDstColumns([])
       setMappingDstColumnsLoading(false)
       setMappingDstColumnsError(null)
       return undefined
     }
     const ac = new AbortController()
-    const cacheKey = `${MAPPING_DST_COLUMN_CACHE_VERSION}|${selectedStateCode || ''}|${table}`
+    const cacheKey = `${MAPPING_DST_COLUMN_CACHE_VERSION}|${selectedStateCode || ''}|${fsName}`
     const hit = mappingDstColumnListCacheRef.current.get(cacheKey)
     if (hit?.length) {
       setMappingDstColumns(sortStringListLocale(hit.map((c) => String(c))))
@@ -2357,7 +2441,11 @@ export default function App() {
     setMappingDstColumnsLoading(true)
     setMappingDstColumnsError(null)
     setMappingDstColumns([])
-    const q = new URLSearchParams({ table, limit: String(MAPPING_DST_COLUMN_SAMPLE_LIMIT) })
+    const q = new URLSearchParams({
+      table: dstFeeScheduleTable,
+      limit: String(MAPPING_DST_COLUMN_SAMPLE_LIMIT),
+      fs_name: fsName,
+    })
     if (selectedStateCode) q.set('state_code', selectedStateCode)
     q.set('response_row_limit', '0')
     fetch(`${API_BASE}/dst/rows?${q}`, { signal: ac.signal })
@@ -2380,7 +2468,7 @@ export default function App() {
       })
       .finally(() => setMappingDstColumnsLoading(false))
     return () => ac.abort()
-  }, [activeNav, mappingDstTable, selectedStateCode])
+  }, [activeNav, mappingDstTable, selectedStateCode, dstFeeScheduleTable])
 
   useEffect(() => {
     if (activeNav !== 'mapping') {
@@ -2420,6 +2508,32 @@ export default function App() {
       .finally(() => setMappingSavedMappingsLoading(false))
     return () => ac.abort()
   }, [activeNav, selectedStateCode, mappingSavedMappingsTick])
+
+  useEffect(() => {
+    if (activeNav !== 'mapping' || !selectedStateCode) {
+      setMappingBulkScheduleNames([])
+      setMappingBulkScheduleNamesLoading(false)
+      return undefined
+    }
+    const ac = new AbortController()
+    setMappingBulkScheduleNamesLoading(true)
+    fetch(
+      `${API_BASE}/app/fee-column-mappings/schedule-names?state_code=${encodeURIComponent(selectedStateCode)}`,
+      { signal: ac.signal },
+    )
+      .then(async (res) => {
+        if (!res.ok) throw new Error(await readHttpErrorMessage(res, `Schedule names failed (${res.status})`))
+        return res.json()
+      })
+      .then((data) => {
+        setMappingBulkScheduleNames(Array.isArray(data?.schedules) ? data.schedules : [])
+      })
+      .catch((e) => {
+        if (e.name !== 'AbortError') setMappingBulkScheduleNames([])
+      })
+      .finally(() => setMappingBulkScheduleNamesLoading(false))
+    return () => ac.abort()
+  }, [activeNav, selectedStateCode])
 
   useEffect(() => {
     if (activeNav !== 'mapping') {
@@ -2645,8 +2759,8 @@ export default function App() {
   }, [selectedStateFeePickRow, agentResult])
 
   const dstTablePickOptions = useMemo(
-    () => dstTables.map((t) => ({ key: `d:${t}`, label: `DST · ${t}` })),
-    [dstTables],
+    () => dstFeeSchedules.map((fs) => ({ key: `d:${fs}`, label: fs })),
+    [dstFeeSchedules],
   )
 
   const dstFeeSelectValue = useMemo(
@@ -2686,7 +2800,7 @@ export default function App() {
   }, [schedulesDstDatePlan, schedulesDstStartDateIso])
 
   const schedulesDstExcelDownloadDisabled =
-    !dstFeeSelectValue || dstTablesLoading || schedulesDstRowsForExcel.length === 0
+    !dstFeeSelectValue || dstFeeSchedulesLoading || schedulesDstRowsForExcel.length === 0
 
   useEffect(() => {
     setSchedulesDstStartDateIso('')
@@ -2900,7 +3014,7 @@ export default function App() {
     }
     const dt = (mappingDstTable || '').trim()
     if (!dt) {
-      setMappingPersistError('Choose a DST table.')
+      setMappingPersistError('Choose a DST fee schedule.')
       return
     }
     if (mappingStateColumns.length === 0 || mappingDstColumns.length === 0) {
@@ -3032,15 +3146,11 @@ export default function App() {
   }, [activeNav, portalEditorStateCode])
 
   useEffect(() => {
-    const needDstTables = activeNav === 'dst' || activeNav === 'schedules' || activeNav === 'mapping'
-    if (!needDstTables) return undefined
+    if (activeNav !== 'dst') return undefined
     const ac = new AbortController()
     setDstTablesLoading(true)
     setDstTablesError(null)
-    const qs = selectedStateCode
-      ? `?state_code=${encodeURIComponent(selectedStateCode)}`
-      : ''
-    fetch(`${API_BASE}/dst/tables${qs}`, { signal: ac.signal })
+    fetch(`${API_BASE}/dst/tables`, { signal: ac.signal })
       .then(async (res) => {
         if (!res.ok) throw new Error(await readHttpErrorMessage(res, `Tables failed (${res.status})`))
         return res.json()
@@ -3057,6 +3167,50 @@ export default function App() {
           setDstTablesError(e?.message || 'Could not load table list — check backend SQL Server settings.')
       })
       .finally(() => setDstTablesLoading(false))
+    return () => ac.abort()
+  }, [activeNav])
+
+  useEffect(() => {
+    if (activeNav !== 'schedules' && activeNav !== 'mapping') {
+      setDstFeeSchedules([])
+      setDstFeeScheduleTable('')
+      setDstFeeSchedulesLoading(false)
+      setDstFeeSchedulesError(null)
+      return undefined
+    }
+    if (!selectedStateCode) {
+      setDstFeeSchedules([])
+      setDstFeeScheduleTable('')
+      setDstFeeSchedulesLoading(false)
+      setDstFeeSchedulesError(null)
+      return undefined
+    }
+    const ac = new AbortController()
+    setDstFeeSchedulesLoading(true)
+    setDstFeeSchedulesError(null)
+    fetch(`${API_BASE}/dst/fee-schedules?state_code=${encodeURIComponent(selectedStateCode)}`, {
+      signal: ac.signal,
+    })
+      .then(async (res) => {
+        if (!res.ok) throw new Error(await readHttpErrorMessage(res, `Fee schedules failed (${res.status})`))
+        return res.json()
+      })
+      .then((data) => {
+        const raw = Array.isArray(data?.schedules) ? data.schedules : []
+        const schedules = [...raw].sort((a, b) =>
+          String(a || '').localeCompare(String(b || ''), undefined, { sensitivity: 'base', numeric: true }),
+        )
+        setDstFeeSchedules(schedules)
+        setDstFeeScheduleTable(String(data?.table || '').trim())
+      })
+      .catch((e) => {
+        if (e.name !== 'AbortError') {
+          setDstFeeSchedules([])
+          setDstFeeScheduleTable('')
+          setDstFeeSchedulesError(e?.message || 'Could not load DST fee schedules for this state.')
+        }
+      })
+      .finally(() => setDstFeeSchedulesLoading(false))
     return () => ac.abort()
   }, [activeNav, selectedStateCode])
 
@@ -3102,10 +3256,11 @@ export default function App() {
   }, [activeNav, clearSchedulesArtifactPreview, closeSchedulesDstFeeModal])
 
   useEffect(() => {
-    if (activeNav !== 'schedules' || !schedulesDstFeeModalOpen || !schedulesDstModalTable) return undefined
-    const table = schedulesDstModalTable
+    if (activeNav !== 'schedules' || !schedulesDstFeeModalOpen || !schedulesDstModalTable || !dstFeeScheduleTable)
+      return undefined
+    const fsName = schedulesDstModalTable
     const ac = new AbortController()
-    const cacheKey = dstSchedulesPreviewCacheKey(selectedStateCode, table)
+    const cacheKey = dstSchedulesPreviewCacheKey(selectedStateCode, fsName)
     const hit = dstSchedulesPreviewCacheRef.current.get(cacheKey)
 
     const applyPreviewRangeFilter = (columns, rows) => {
@@ -3132,7 +3287,7 @@ export default function App() {
     setSchedulesDstError(null)
     setSchedulesDstCols([])
     setSchedulesDstRows([])
-    void fetchDstSchedulesPreviewRows(table, selectedStateCode, ac.signal)
+    void fetchDstSchedulesPreviewRows(dstFeeScheduleTable, fsName, selectedStateCode, ac.signal)
       .then((data) => {
         dstSchedulesPreviewCacheRef.current.set(cacheKey, { columns: data.columns, rows: data.rows })
         trimSchedulesPreviewMap(dstSchedulesPreviewCacheRef.current, SCHEDULES_PREVIEW_CACHE_LIMIT)
@@ -3152,7 +3307,7 @@ export default function App() {
         setSchedulesDstPrefetchTick((n) => n + 1)
       })
     return () => ac.abort()
-  }, [activeNav, schedulesDstFeeModalOpen, schedulesDstModalTable, selectedStateCode])
+  }, [activeNav, schedulesDstFeeModalOpen, schedulesDstModalTable, selectedStateCode, dstFeeScheduleTable])
 
   useEffect(() => {
     if (
@@ -3232,12 +3387,12 @@ export default function App() {
   useEffect(() => {
     if (activeNav !== 'schedules') return undefined
     const m = schedulesDstFeeKey.match(/^d:(.+)$/)
-    if (!m) return undefined
-    const table = m[1]
-    const cacheKey = dstSchedulesPreviewCacheKey(selectedStateCode, table)
+    if (!m || !dstFeeScheduleTable) return undefined
+    const fsName = m[1]
+    const cacheKey = dstSchedulesPreviewCacheKey(selectedStateCode, fsName)
     if (dstSchedulesPreviewCacheRef.current.has(cacheKey)) return undefined
     const ac = new AbortController()
-    void fetchDstSchedulesPreviewRows(table, selectedStateCode, ac.signal)
+    void fetchDstSchedulesPreviewRows(dstFeeScheduleTable, fsName, selectedStateCode, ac.signal)
       .then((data) => {
         dstSchedulesPreviewCacheRef.current.set(cacheKey, { columns: data.columns, rows: data.rows })
         trimSchedulesPreviewMap(dstSchedulesPreviewCacheRef.current, SCHEDULES_PREVIEW_CACHE_LIMIT)
@@ -3247,7 +3402,7 @@ export default function App() {
         setSchedulesDstPrefetchTick((n) => n + 1)
       })
     return () => ac.abort()
-  }, [activeNav, schedulesDstFeeKey, selectedStateCode])
+  }, [activeNav, schedulesDstFeeKey, selectedStateCode, dstFeeScheduleTable])
 
   useEffect(() => {
     if (!schedulesStateFeeModalOpen && !schedulesDstFeeModalOpen) return undefined
@@ -3380,6 +3535,7 @@ export default function App() {
       await refreshArtifactHistory()
       void refreshPortalLinks()
       void refreshCompanionHealth()
+      setSchedulesRecentComparesTick((t) => t + 1)
     } catch (e) {
       if (stateAtStart === selectedStateCodeRef.current) {
         setAgentError(e.message || 'Failed to reach agent')
@@ -3430,6 +3586,12 @@ export default function App() {
         msg = `${msg} Removed ${p} saved file(s) that no longer appear on the portal.`
       }
     }
+    const dur = Number(agentResult.run_duration_seconds)
+    if (Number.isFinite(dur) && dur >= 0) {
+      msg = `${msg} Run time: ${dur.toFixed(1)}s.`
+    }
+    const tok = formatLlmTokenUsageSummary(agentResult.llm_token_usage)
+    if (tok) msg = `${msg} ${tok}`
     return msg
   }, [agentResult])
 
@@ -3565,6 +3727,7 @@ export default function App() {
         throw new Error(detail)
       }
       const data = JSON.parse(raw)
+      cacheCompareReplayPayload(data, compareReplayCacheRef)
       setSchedulesCompareResult(data)
       setSchedulesCompareOpen(true)
       const stateRow = stateFeePickRows.find((r) => r.key === schedulesStateFeeKey)
@@ -3576,19 +3739,7 @@ export default function App() {
         dstTable: dm[1].trim(),
       })
       setSchedulesMetricsTick((t) => t + 1)
-      const recentPushed = pushFeeToolRecentCompare(
-        snapshotCompareForRecentHistory(data, {
-          stateCode: selectedStateCode,
-          stateDisplay: stateNameFromCode(selectedStateCode),
-          artifactLabel: stateRow?.label || `Saved file #${am[1]}`,
-          dstTable: dm[1].trim(),
-          artifactId: Number(am[1], 10),
-          effectiveDateIso: schedulesDstStartDateIso.trim(),
-        }),
-      )
-      if (recentPushed) {
-        setSchedulesRecentComparesTick((t) => t + 1)
-      }
+      setSchedulesRecentComparesTick((t) => t + 1)
     } catch (e) {
       setSchedulesCompareResult(null)
       setSchedulesCompareError(e?.message || 'Compare failed.')
@@ -3778,37 +3929,116 @@ export default function App() {
     portalLinkRow?.last_agent_run_at_utc,
   ])
 
-  const feeSchedRecentCompareRows = useMemo(() => {
-    void schedulesRecentComparesTick
-    const sc = (selectedStateCode || '').trim().toUpperCase()
-    if (!sc) return []
-    const rows = readFeeToolRecentCompares().filter((e) => e?.stateCode === sc)
-    rows.sort((a, b) => {
-      const ta = Date.parse(a?.at || '') || 0
-      const tb = Date.parse(b?.at || '') || 0
-      return tb - ta
-    })
-    return rows
-  }, [selectedStateCode, schedulesRecentComparesTick])
+  const refreshCompareRuns = useCallback(async () => {
+    const sc = (selectedStateCode || '').trim()
+    if (!sc) {
+      setCompareRunsRows([])
+      setCompareRunsError(null)
+      return
+    }
+    setCompareRunsLoading(true)
+    setCompareRunsError(null)
+    try {
+      const res = await fetch(
+        `${API_BASE}/app/compare-runs?state_code=${encodeURIComponent(sc)}&limit=50`,
+      )
+      if (!res.ok) {
+        throw new Error(await readHttpErrorMessage(res, `Compare history failed (${res.status})`))
+      }
+      const data = await res.json()
+      const raw = Array.isArray(data?.compare_runs) ? data.compare_runs : []
+      setCompareRunsRows(raw.map(mapCompareRunApiRow).filter(Boolean))
+    } catch (e) {
+      setCompareRunsRows([])
+      setCompareRunsError(e?.message || 'Could not load recent comparisons.')
+    } finally {
+      setCompareRunsLoading(false)
+    }
+  }, [selectedStateCode])
 
-  const openSavedFeeComparison = useCallback((entry) => {
-    const r = recentCompareEntryToResult(entry)
-    if (!r) return
-    setSchedulesCompareError(null)
-    setSchedulesCompareResult(r)
-    setSchedulesCompareOpen(true)
-  }, [])
+  useEffect(() => {
+    if (activeNav !== 'schedules' && activeNav !== 'scheduleVersions') return undefined
+    void refreshCompareRuns()
+  }, [activeNav, refreshCompareRuns, schedulesRecentComparesTick])
+
+  const feeSchedRecentCompareRows = useMemo(() => compareRunsRows, [compareRunsRows])
+
+  const openSavedFeeComparison = useCallback(
+    async (entry) => {
+      if (entry?.snapshot?.rows?.length) {
+        const r = recentCompareEntryToResult(entry)
+        if (!r) return
+        setSchedulesCompareError(null)
+        setSchedulesCompareReplayLoading(false)
+        setSchedulesCompareResult(r)
+        setSchedulesCompareOpen(true)
+        return
+      }
+      const cid = Number(entry?.compareRunId)
+      const sc = entry?.stateCode || selectedStateCode
+      if (!Number.isFinite(cid) || !sc) return
+
+      const cached = compareReplayCacheRef.current.get(cid)
+      if (cached) {
+        setSchedulesCompareError(null)
+        setSchedulesCompareReplayLoading(false)
+        setSchedulesCompareResult(cached)
+        setSchedulesCompareOpen(true)
+        return
+      }
+
+      setSchedulesCompareReplayLoading(true)
+      setSchedulesCompareError(null)
+      setSchedulesCompareResult(null)
+      setSchedulesCompareOpen(true)
+      try {
+        const res = await fetch(
+          `${API_BASE}/app/compare-runs/${encodeURIComponent(String(cid))}?state_code=${encodeURIComponent(sc)}`,
+        )
+        const raw = await res.text()
+        if (!res.ok) {
+          let detail = `Could not load saved comparison (${res.status})`
+          try {
+            const j = JSON.parse(raw)
+            if (typeof j.detail === 'string') detail = j.detail
+          } catch {
+            if (raw.trim()) detail = raw.trim().slice(0, 400)
+          }
+          throw new Error(detail)
+        }
+        const data = JSON.parse(raw)
+        const replay = data?.replay
+        if (!replay || typeof replay !== 'object') {
+          throw new Error('Saved comparison snapshot is missing.')
+        }
+        cacheCompareReplayPayload(replay, compareReplayCacheRef)
+        setSchedulesCompareResult(replay)
+      } catch (e) {
+        setSchedulesCompareResult(null)
+        setSchedulesCompareError(e?.message || 'Could not open saved comparison.')
+      } finally {
+        setSchedulesCompareReplayLoading(false)
+      }
+    },
+    [selectedStateCode],
+  )
 
   const downloadSavedFeeComparison = useCallback((entry) => {
+    if (entry?.compareRunId != null && entry?.hasWorkbook) {
+      const sc = entry.stateCode || selectedStateCode || ''
+      const url = `${API_BASE}/app/compare-runs/${encodeURIComponent(String(entry.compareRunId))}/download?state_code=${encodeURIComponent(sc)}`
+      window.open(url, '_blank', 'noopener,noreferrer')
+      return
+    }
     const shell = recentCompareEntryToResult(entry)
     const rows = Array.isArray(entry?.snapshot?.rows) ? entry.snapshot.rows : []
     if (!shell || !rows.length) {
-      window.alert('No changed rows saved for this entry.')
+      window.alert('No changed workbook saved for this comparison.')
       return
     }
     const baseName = `compare_${entry?.stateCode || 'SC'}_${entry?.dstFsname || 'dst'}`.replace(/[^\w.-]+/g, '_')
     downloadFeeCompareWorkbook(baseName, shell, rows)
-  }, [])
+  }, [selectedStateCode])
 
   return (
     <div className="app-shell">
@@ -3878,7 +4108,7 @@ export default function App() {
                   </span>
                 </div>
                 <div className="app-sidebar__sync-card">
-                  <div className="app-sidebar__sync-card-head">Last sync</div>
+                  <div className="app-sidebar__sync-card-head">Last sync (IST)</div>
                   <p className="app-sidebar__sync-time">
                     {formatPortalLastRunAt(portalLinkRow?.last_agent_run_at_utc)}
                   </p>
@@ -3941,7 +4171,7 @@ export default function App() {
                         <thead>
                           <tr>
                             <th scope="col">Schedule</th>
-                            <th scope="col">DST table</th>
+                            <th scope="col">DST fee schedule</th>
                             <th scope="col">Pairs</th>
                             <th scope="col">Updated</th>
                             <th scope="col" className="app-mapping-inventory-table__actions">
@@ -4013,17 +4243,41 @@ export default function App() {
                     </h3>
                   </div>
                   <p className="app-muted app-mapping-bulk-import-hint">
-                    Upload CSV or Excel (first sheet). Required columns{' '}
-                    <code className="app-code-inline">StateSchedule</code> or{' '}
-                    <code className="app-code-inline">ArtifactId</code>,{' '}
-                    <code className="app-code-inline">DstSchedule</code>,{' '}
+                    Upload CSV or Excel (first sheet). One row per column pair; rows with the same{' '}
+                    <code className="app-code-inline">StateSchedule</code> +{' '}
+                    <code className="app-code-inline">DstSchedule</code> become one saved mapping (schedule family —
+                    all future file versions reuse it). Required:{' '}
+                    <code className="app-code-inline">StateSchedule</code> (fee schedule name, e.g.{' '}
+                    <code className="app-code-inline">Physician Assistant</code>),{' '}
+                    <code className="app-code-inline">DstSchedule</code> (DST fsname),{' '}
                     <code className="app-code-inline">StateColumn</code>,{' '}
-                    <code className="app-code-inline">DstColumn</code>; optional{' '}
+                    <code className="app-code-inline">DstColumn</code>. Optional{' '}
                     <code className="app-code-inline">Action</code> (
                     <code className="app-code-inline">replace</code> or{' '}
-                    <code className="app-code-inline">merge</code> — last row in each group wins). Rows that share the same
-                    schedule and DST target are merged into one saved mapping.
+                    <code className="app-code-inline">merge</code>). Use{' '}
+                    <code className="app-code-inline">ArtifactId</code> only when the name is ambiguous.
                   </p>
+                  {mappingBulkScheduleNamesLoading ? (
+                    <p className="app-muted app-mapping-bulk-import-hint">Loading schedule names…</p>
+                  ) : mappingBulkScheduleNames.length > 0 ? (
+                    <details className="app-mapping-bulk-schedule-names">
+                      <summary className="app-muted">
+                        {mappingBulkScheduleNames.length} schedule names accepted for{' '}
+                        {stateNameFromCode(selectedStateCode)} in{' '}
+                        <code className="app-code-inline">StateSchedule</code>
+                      </summary>
+                      <ul className="app-mapping-bulk-schedule-names__list">
+                        {mappingBulkScheduleNames.slice(0, 40).map((s) => (
+                          <li key={String(s.logical_schedule_key || s.schedule_name)}>
+                            <code className="app-code-inline">{String(s.schedule_name || '').trim()}</code>
+                          </li>
+                        ))}
+                        {mappingBulkScheduleNames.length > 40 ? (
+                          <li className="app-muted">…and {mappingBulkScheduleNames.length - 40} more</li>
+                        ) : null}
+                      </ul>
+                    </details>
+                  ) : null}
                   <form className="app-mapping-bulk-import-form" onSubmit={(e) => void submitMappingBulkImport(e)}>
                     <div className="app-mapping-bulk-import-row">
                       <input
@@ -4101,7 +4355,8 @@ export default function App() {
                           <ul>
                             {mappingBulkApiResult.applied.map((a, i) => (
                               <li key={`ma-${i}`}>
-                                artifact {a.artifact_id} →{' '}
+                                <strong>{String(a.schedule_name || 'Schedule').trim()}</strong>
+                                {' → '}
                                 <code className="app-code-inline">{String(a.dst_fsname || '')}</code>
                                 {' — '}
                                 {Number(a.pairs) || 0} pair(s)
@@ -4216,19 +4471,19 @@ export default function App() {
                           </div>
                           <div className="app-mapping-unified-field">
                             <label className="app-field-label" htmlFor="mapping-dst-table-pick">
-                              DST table / view
+                              DST fee schedule
                             </label>
                             <select
                               id="mapping-dst-table-pick"
                               className="app-select app-select--lg"
                               value={mappingDstTable}
-                              disabled={!selectedStateCode || dstTablesLoading}
+                              disabled={!selectedStateCode || dstFeeSchedulesLoading}
                               onChange={(e) => setMappingDstTable(e.target.value)}
                             >
                               <option value="">—</option>
-                              {dstTables.map((t) => (
-                                <option key={`map-dst-${t}`} value={t}>
-                                  {t}
+                              {dstFeeSchedules.map((fs) => (
+                                <option key={`map-dst-${fs}`} value={fs}>
+                                  {fs}
                                 </option>
                               ))}
                             </select>
@@ -4247,9 +4502,9 @@ export default function App() {
                             {stateArtifactsError}
                           </p>
                         ) : null}
-                        {dstTablesError ? (
+                        {dstFeeSchedulesError ? (
                           <p className="app-error" role="alert">
-                            {dstTablesError}
+                            {dstFeeSchedulesError}
                           </p>
                         ) : null}
 
@@ -5430,7 +5685,7 @@ export default function App() {
                       onChange={(e) => setSchedulesDstFeeKey(e.target.value)}
                     >
                       <option value="">
-                        {dstTablesLoading
+                        {dstFeeSchedulesLoading
                           ? 'Loading…'
                           : dstTablePickOptions.length
                             ? 'Choose…'
@@ -5443,9 +5698,9 @@ export default function App() {
                       ))}
                     </select>
 
-                    {dstTablesError ? (
+                    {dstFeeSchedulesError ? (
                       <p className="app-error" role="alert" style={{ marginTop: '0.5rem' }}>
-                        {dstTablesError}
+                        {dstFeeSchedulesError}
                       </p>
                     ) : null}
 
@@ -5458,7 +5713,7 @@ export default function App() {
                           id="sched-dst-start-date"
                           className="app-select app-select--lg"
                           value={schedulesDstStartDateIso}
-                          disabled={!dstFeeSelectValue || dstTablesLoading}
+                          disabled={!dstFeeSelectValue || dstFeeSchedulesLoading}
                           onChange={(e) => setSchedulesDstStartDateIso(e.target.value)}
                         >
                           <option value="">
@@ -5478,7 +5733,7 @@ export default function App() {
                         </select>
                         {schedulesDstCardCache?.columns?.length && !schedulesDstDatePlan.dateCol ? (
                           <p className="app-error app-fee-dst-msg" role="status">
-                            No effective-date column in this table.
+                            No effective-date column in this fee schedule.
                           </p>
                         ) : null}
                       </div>
@@ -5488,7 +5743,7 @@ export default function App() {
                       <button
                         type="button"
                         className="app-btn"
-                        disabled={!dstFeeSelectValue || dstTablesLoading}
+                        disabled={!dstFeeSelectValue || dstFeeSchedulesLoading}
                         onClick={() => {
                           const m = dstFeeSelectValue.match(/^d:(.+)$/)
                           if (m) {
@@ -5562,20 +5817,34 @@ export default function App() {
                 <section className="app-card app-card--recent-compares" aria-label="Recent fee comparisons">
                   <div className="app-recent-compares-head">
                     <h3 className="app-card__title app-card__title--sm app-recent-compares-title">Recent comparisons</h3>
+                    {selectedStateCode ? (
+                      <p className="app-muted app-schedules-count" role="status">
+                        {compareRunsLoading
+                          ? 'Loading comparisons…'
+                          : `${feeSchedRecentCompareRows.length} for ${stateNameFromCode(selectedStateCode) || selectedStateCode}`}
+                      </p>
+                    ) : null}
                   </div>
-                  {feeSchedRecentCompareRows.length ? (
+                  {compareRunsError ? (
+                    <p className="app-error" role="alert">
+                      {compareRunsError}
+                    </p>
+                  ) : null}
+                  {!selectedStateCode ? (
+                    <p className="app-muted">Select a state in the sidebar to see comparison history.</p>
+                  ) : compareRunsLoading && !feeSchedRecentCompareRows.length ? (
+                    <p className="app-muted">Loading recent comparisons…</p>
+                  ) : feeSchedRecentCompareRows.length ? (
                     <div className="app-table-scroll app-table-scroll--recent-compares">
                       <table className="app-data-table app-data-table--recent-compares">
                         <thead>
                           <tr>
-                            <th>State</th>
+                            <th>Schedule</th>
                             <th>DST file</th>
-                            <th title="DST effective-date filter used when you ran Compare (if set); otherwise inferred from row data">
-                              Effective date
-                            </th>
+                            <th>Source</th>
                             <th>Match %</th>
                             <th>Differences</th>
-                            <th>Run at</th>
+                            <th>Compared at</th>
                             <th>Status</th>
                             <th>Actions</th>
                           </tr>
@@ -5589,17 +5858,39 @@ export default function App() {
                             const missSt = Number(summary.dst_only_row_count) || 0
                             const totalDiff = mod + missDst + missSt
                             const dstNm = entry.dstFsname || '—'
+                            const srcLabel = entry.triggerSource === 'sync' ? 'Auto' : 'Manual'
+                            const st = entry.status || ''
+                            const statusLabel =
+                              st === 'success'
+                                ? 'Changes'
+                                : st === 'no_changes'
+                                  ? 'No changes'
+                                  : st === 'error'
+                                    ? 'Error'
+                                    : st || '—'
+                            const statusClass =
+                              st === 'success'
+                                ? 'app-badge--success'
+                                : st === 'no_changes'
+                                  ? 'app-badge--muted'
+                                  : st === 'error'
+                                    ? 'app-badge--danger'
+                                    : 'app-badge--muted'
                             return (
                               <tr key={entry.id}>
-                                <td>{entry.stateDisplay || stateNameFromCode(entry.stateCode) || entry.stateCode || '—'}</td>
+                                <td>
+                                  <span className="app-recent-cell-file" title={entry.artifactLabel}>
+                                    {entry.artifactLabel}
+                                  </span>
+                                </td>
                                 <td>
                                   <span className="app-recent-cell-file" title={dstNm}>
                                     {dstNm}
                                   </span>
                                 </td>
-                                <td>{feeCompareFormatEffectiveHint(entry.effectiveHint)}</td>
+                                <td>{srcLabel}</td>
                                 <td>
-                                  {mp != null ? (
+                                  {mp != null && st !== 'error' ? (
                                     <div className="app-recent-match-cell">
                                       <span className="app-recent-match-pct">{`${mp.toFixed(1)}%`}</span>
                                       <div className="app-fee-compare-match-bar-wrap app-recent-match-bar-wrap" aria-hidden="true">
@@ -5611,22 +5902,29 @@ export default function App() {
                                   )}
                                 </td>
                                 <td>
-                                  <strong className="app-recent-diff-total" title="Total differing rows (full compare)">
-                                    {String(totalDiff)}
+                                  <strong className="app-recent-diff-total" title="Total differing rows">
+                                    {st === 'error' ? '—' : String(totalDiff)}
                                   </strong>
                                 </td>
                                 <td>{formatPortalLastRunAt(entry.at)}</td>
                                 <td>
-                                  <span className="app-badge app-badge--success">Saved</span>
+                                  <span className={`app-badge ${statusClass}`} title={entry.errorMessage || statusLabel}>
+                                    {statusLabel}
+                                  </span>
                                 </td>
                                 <td>
                                   <div className="app-recent-compares-actions">
                                     <button
                                       type="button"
                                       className="app-btn-icon"
-                                      title="Open comparison"
-                                      aria-label="Open comparison"
-                                      onClick={() => openSavedFeeComparison(entry)}
+                                      title={
+                                        entry.hasSnapshot !== true
+                                          ? 'No saved snapshot — run Compare again'
+                                          : 'View saved comparison'
+                                      }
+                                      aria-label="View saved comparison"
+                                      disabled={st === 'error' || entry.hasSnapshot !== true}
+                                      onClick={() => void openSavedFeeComparison(entry)}
                                     >
                                       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                                         <path
@@ -5642,8 +5940,9 @@ export default function App() {
                                     <button
                                       type="button"
                                       className="app-btn-icon"
-                                      title="Download workbook (Modified, Added in State, DST-not-in-State)"
-                                      aria-label="Download compare workbook"
+                                      title="Download changed workbook"
+                                      aria-label="Download changed workbook"
+                                      disabled={!entry.hasWorkbook}
                                       onClick={() => downloadSavedFeeComparison(entry)}
                                     >
                                       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -5664,6 +5963,8 @@ export default function App() {
                         </tbody>
                       </table>
                     </div>
+                  ) : !compareRunsLoading ? (
+                    <p className="app-muted">No comparisons yet for this state — run Compare or sync a mapped schedule.</p>
                   ) : null}
                 </section>
 
@@ -5695,10 +5996,11 @@ export default function App() {
         <div
           className="app-modal-backdrop"
           role="presentation"
-          onMouseDown={(e) => {
+            onMouseDown={(e) => {
             if (e.target === e.currentTarget) {
               setSchedulesCompareOpen(false)
               setSchedulesCompareError(null)
+              setSchedulesCompareReplayLoading(false)
             }
           }}
         >
@@ -5719,6 +6021,7 @@ export default function App() {
                 onClick={() => {
                   setSchedulesCompareOpen(false)
                   setSchedulesCompareError(null)
+                  setSchedulesCompareReplayLoading(false)
                 }}
                 aria-label="Close"
               >
@@ -5726,7 +6029,12 @@ export default function App() {
               </button>
             </div>
             <div className="app-modal__body app-modal__body--compare">
-              {schedulesCompareError ? (
+              {schedulesCompareReplayLoading ? (
+                <div className="app-fee-bridge-status" role="status" aria-live="polite">
+                  <span className="app-fee-bridge-spinner" aria-hidden />
+                  <span className="app-muted app-fee-bridge-processing">Loading saved comparison…</span>
+                </div>
+              ) : schedulesCompareError ? (
                 <p className="app-error" role="alert">
                   {schedulesCompareError}
                 </p>

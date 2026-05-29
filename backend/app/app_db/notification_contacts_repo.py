@@ -159,3 +159,38 @@ def delete_notification_contact(*, contact_id: int, state_code: str) -> bool:
         )
         cx.commit()
         return (cur.rowcount or 0) > 0
+
+
+def list_notification_recipient_emails(
+    *,
+    state_code: str,
+    notify_new_state_file: bool = False,
+    notify_compare_result: bool = False,
+) -> List[str]:
+    """Distinct enabled recipient emails for a state matching the requested toggles."""
+    sc = resolve_us_state_code(str(state_code or ""))
+    clauses = ["state_code = ?", "notifications_enabled = 1"]
+    params: List[Any] = [sc]
+    toggle_parts: List[str] = []
+    if notify_new_state_file:
+        toggle_parts.append("notify_new_state_file = 1")
+    if notify_compare_result:
+        toggle_parts.append("notify_compare_result = 1")
+    if not toggle_parts:
+        return []
+    clauses.append(f"({' OR '.join(toggle_parts)})")
+    sql = f"""
+        SELECT DISTINCT LOWER(LTRIM(RTRIM(email))) AS email
+        FROM dbo.fee_schedule_notification_contact
+        WHERE {' AND '.join(clauses)}
+        ORDER BY email ASC
+    """
+    with app_db_connect() as cx:
+        cur = cx.cursor()
+        cur.execute(sql, tuple(params))
+        out: List[str] = []
+        for row in cur.fetchall():
+            em = str(row[0] or "").strip().lower()
+            if em and "@" in em:
+                out.append(em)
+        return out

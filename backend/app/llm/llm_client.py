@@ -1,6 +1,7 @@
 # backend/app/llm/llm_client.py
 from groq import Groq
 from app.config.settings import GROQ_API_KEY, MODEL_NAME
+from app.llm.groq_usage import record_groq_completion
 from bs4 import BeautifulSoup
 import re
 import json
@@ -8,6 +9,12 @@ import time
 from typing import Any, List, Optional
 
 client = Groq(api_key=GROQ_API_KEY)
+
+
+def _groq_chat(*, purpose: str, **kwargs):
+    response = client.chat.completions.create(**kwargs)
+    record_groq_completion(response, purpose=purpose)
+    return response
 
 
 def _groq_error_text(exc: BaseException) -> str:
@@ -111,7 +118,8 @@ Rules:
 - If uncertain, lower confidence; still choose the best guess.
 """
 
-    response = client.chat.completions.create(
+    response = _groq_chat(
+        purpose="classify_schedule_blocks",
         model=MODEL_NAME,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.1,
@@ -216,7 +224,8 @@ Output shape: {{"rows":[{{"table_index":0,"row_index":0,"documents":[{{"url_id":
     last_err: BaseException | None = None
     for attempt in range(max_retries):
         try:
-            response = client.chat.completions.create(
+            response = _groq_chat(
+                purpose="catalog_link_labels",
                 model=MODEL_NAME,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.05,
@@ -291,7 +300,8 @@ Return ONLY JSON:
     last_err: BaseException | None = None
     for attempt in range(max_retries):
         try:
-            response = client.chat.completions.create(
+            response = _groq_chat(
+                purpose="fee_document_filter",
                 model=MODEL_NAME,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.05,
@@ -351,7 +361,8 @@ def analyze_structure(html):
     {cleaned}
     """
 
-    response = client.chat.completions.create(
+    response = _groq_chat(
+        purpose="analyze_structure",
         model=MODEL_NAME,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -405,10 +416,11 @@ Return ONLY valid JSON in this format:
 }}
 """
 
-    response = client.chat.completions.create(
+    response = _groq_chat(
+        purpose="classify_sections",
         model=MODEL_NAME,
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.1
+        temperature=0.1,
     )
 
     content = response.choices[0].message.content.strip()

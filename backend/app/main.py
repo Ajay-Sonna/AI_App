@@ -18,12 +18,15 @@ from app.app_db.artifacts_repo import (
     recompute_is_current_for_state,
 )
 from app.app_db.connection import app_db_configured
-from app.app_db import fee_column_mappings_repo, notification_contacts_repo, state_links_repo
+from app.app_db import compare_runs_repo, fee_column_mappings_repo, notification_contacts_repo, state_links_repo
 from app.dst_db.service import (
     _dst_configured,
     _resolve_state_code_column,
     fetch_dst_table_rows,
+    get_fee_schedule_table,
+    list_dst_fee_schedules,
     list_dst_tables,
+    validate_fs_name,
     validate_table_name,
 )
 from app.preview.preview_service import build_artifact_table_preview, build_preview_payload, streaming_fetch_resource
@@ -41,7 +44,8 @@ from app.agents.catalog_file_urls import (
 )
 from app.agents.run_agent import run_pipeline
 from app.config.settings import ARTIFACT_DOWNLOAD_MAX_PER_RUN, RUN_PAGINATION_WALL_SECONDS_DEFAULT
-from app.compare_fee_schedules import compare_artifact_to_dst
+from app.compare_persist import compare_run_replay_payload, run_compare_and_persist
+from app.fee_schedule_identity import list_schedule_families_for_state
 from app.mapping_bulk_import import run_bulk_mapping_import
 from app.storage.artifact_download import (
     build_artifact_browser_download_filename,
@@ -156,7 +160,7 @@ class FeeScheduleCompareRequest(BaseModel):
 
 
 class NotificationContactUpsert(BaseModel):
-    """Create or update a per-state notification contact (email delivery not implemented yet)."""
+    """Create or update a per-state notification contact."""
 
     state_code: str
     contact_name: str = Field(..., min_length=1, max_length=256)
@@ -170,7 +174,11 @@ class NotificationContactUpsert(BaseModel):
 
 def _json_safe_value(v):
     if isinstance(v, datetime):
-        return v.isoformat()
+        # Companion DB datetimes are UTC (SYSUTCDATETIME) but pyodbc returns naive values.
+        iso = v.isoformat()
+        if v.tzinfo is None and not iso.endswith("Z") and "+" not in iso[-6:]:
+            return f"{iso}Z"
+        return iso
     if isinstance(v, date):
         return v.isoformat()
     if isinstance(v, Decimal):
@@ -201,6 +209,36 @@ def _notification_contact_api_row(row: dict) -> dict:
             out["notification_contact_id"] = int(nid)
         except (TypeError, ValueError):
             pass
+    return out
+
+
+def _compare_run_api_row(row: dict) -> dict:
+    out = _json_safe_row(dict(row))
+    raw_summary = out.pop("summary_json", None)
+    summary: Dict[str, Any] = {}
+    if raw_summary:
+        try:
+            parsed = json.loads(str(raw_summary))
+            if isinstance(parsed, dict):
+                summary = parsed
+        except json.JSONDecodeError:
+            summary = {}
+    out["summary"] = summary
+    label = str(out.get("source_label") or out.get("original_filename") or out.get("logical_schedule_key") or "").strip()
+    out["artifact_label"] = label or None
+    out.pop("source_label", None)
+    out.pop("original_filename", None)
+    raw_snap = out.pop("result_snapshot_json", None)
+    out["has_snapshot"] = bool(raw_snap and str(raw_snap).strip())
+    rel = str(out.get("changes_workbook_rel_path") or "").strip()
+    out["has_workbook"] = bool(rel)
+    for k in ("compare_run_id", "artifact_id", "mapping_id", "changes_workbook_bytes"):
+        v = out.get(k)
+        if v is not None:
+            try:
+                out[k] = int(v)
+            except (TypeError, ValueError):
+                pass
     return out
 
 
@@ -405,6 +443,18 @@ def run(request: RunRequest):
         except Exception as ex:
             logger.warning("Could not update last_agent_run_at_utc for %s: %s", sc, ex)
 
+    if sc and app_db_configured() and not result.get("blocked"):
+        try:
+            from app.notifications.sync_notifications import handle_post_sync_notifications
+
+            result["notification_email"] = handle_post_sync_notifications(
+                state_code=sc,
+                artifacts_saved=result.get("artifacts_saved"),
+            )
+        except Exception as ex:
+            logger.warning("Post-sync notification email failed for %s: %s", sc, ex)
+            result["notification_email"] = {"ok": False, "error": str(ex)}
+
     return result
 
 
@@ -490,11 +540,39 @@ def dst_tables_list(
     return {"tables": tables, "state_filter": sf}
 
 
+@app.get("/dst/fee-schedules")
+def dst_fee_schedules_list(
+    state_code: str = Query(..., description="USPS state code; returns distinct fs_name rows for that state."),
+):
+    """List logical DST fee schedules (``fs_name``) from the configured raw table."""
+    if not _dst_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="DST database not configured: set MSSQL_ODBC_CONN or MSSQL_SERVER in the environment.",
+        )
+    sc = _optional_resolved_state(state_code)
+    if sc is None:
+        raise HTTPException(status_code=400, detail="state_code is required.")
+    try:
+        table = get_fee_schedule_table()
+        schedules = list_dst_fee_schedules(state_code=sc)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve)) from ve
+    except Exception as ex:
+        logger.exception("DST fee-schedules list failed")
+        raise HTTPException(status_code=503, detail=str(ex)) from ex
+    return {"ok": True, "table": table, "state_code": sc, "schedules": schedules}
+
+
 @app.get("/dst/rows")
 def dst_table_rows(
     table: str = Query(..., min_length=1, max_length=128),
     limit: int = Query(2000, ge=1, le=10_000),
     state_code: str | None = Query(None, description="When table has state_code column, filter rows"),
+    fs_name: str | None = Query(
+        None,
+        description="When set, filter rows to this logical fee schedule (fs_name column).",
+    ),
     response_row_limit: int | None = Query(
         None,
         ge=0,
@@ -514,8 +592,19 @@ def dst_table_rows(
         raise HTTPException(status_code=400, detail="Invalid table name") from None
 
     sc = _optional_resolved_state(state_code)
+    fs_trim = (fs_name or "").strip() or None
+    if fs_trim:
+        try:
+            validate_fs_name(fs_trim)
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve)) from ve
     try:
-        columns, rows = fetch_dst_table_rows(table, limit=limit, state_code=sc)
+        columns, rows = fetch_dst_table_rows(
+            table,
+            limit=limit,
+            state_code=sc,
+            fs_name=fs_trim,
+        )
         if response_row_limit is not None:
             rows = rows[: response_row_limit]
     except ValueError as ve:
@@ -532,6 +621,8 @@ def dst_table_rows(
         meta["state_filter_applied"] = bool(col)
         if not col:
             meta["state_filter_note"] = "Table has no state_code column; rows are unfiltered."
+    if fs_trim:
+        meta["fs_name_filter"] = fs_trim
     return meta
 
 
@@ -926,7 +1017,7 @@ def app_get_latest_fee_column_mapping(
     dst_trim = (dst_fsname or "").strip() or None
     if dst_trim:
         try:
-            validate_table_name(dst_trim)
+            validate_fs_name(dst_trim)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid dst_fsname") from None
     try:
@@ -1016,7 +1107,7 @@ def app_upsert_fee_column_mapping(body: FeeColumnMappingUpsert):
             detail="Artifact state_code does not match the requested state_code.",
         )
     try:
-        dst = validate_table_name(body.dst_fsname)
+        dst = validate_fs_name(body.dst_fsname)
         lsk = fee_column_mappings_repo.resolve_schedule_key_for_artifact(row_art)
         saved = fee_column_mappings_repo.upsert_fee_column_mapping(
             state_code=sc,
@@ -1032,6 +1123,26 @@ def app_upsert_fee_column_mapping(body: FeeColumnMappingUpsert):
         raise HTTPException(status_code=503, detail=str(ex)) from ex
     cm = _column_map_object(saved.get("column_map_json"))
     return {"ok": True, "mapping": _json_safe_row(saved), "column_map": cm}
+
+
+@app.get("/app/fee-column-mappings/schedule-names")
+def app_list_mapping_schedule_names(
+    state_code: str = Query(..., description="USPS state code"),
+    limit: int = Query(2000, ge=1, le=5000),
+):
+    """Human-readable schedule family names accepted by bulk import ``StateSchedule`` column."""
+    if not app_db_configured():
+        raise HTTPException(status_code=503, detail="App database not configured.")
+    sc = _optional_resolved_state(state_code)
+    if sc is None:
+        raise HTTPException(status_code=400, detail="state_code is required.")
+    try:
+        arts = list_artifacts(state_code=sc, current_only=False, limit=limit)
+        families = list_schedule_families_for_state(arts)
+    except Exception as ex:
+        logger.exception("schedule-names list failed")
+        raise HTTPException(status_code=503, detail=str(ex)) from ex
+    return {"ok": True, "state_code": sc, "schedules": families}
 
 
 @app.post("/app/fee-column-mappings/bulk-import")
@@ -1075,12 +1186,84 @@ def app_fee_schedule_compare(body: FeeScheduleCompareRequest):
     if sc is None:
         raise HTTPException(status_code=400, detail="state_code is required.")
     try:
-        return compare_artifact_to_dst(state_code=sc, artifact_id=body.artifact_id, dst_fsname=body.dst_fsname)
+        return run_compare_and_persist(
+            state_code=sc,
+            artifact_id=int(body.artifact_id),
+            dst_fsname=body.dst_fsname,
+            trigger_source="manual",
+        )
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve)) from ve
     except Exception as ex:
         logger.exception("fee-schedules compare failed")
         raise HTTPException(status_code=503, detail=str(ex)) from ex
+
+
+@app.get("/app/compare-runs")
+def app_list_compare_runs(
+    state_code: str = Query(..., min_length=2, max_length=8),
+    limit: int = Query(50, ge=1, le=200),
+):
+    if not app_db_configured():
+        raise HTTPException(status_code=503, detail="App database not configured.")
+    sc = _optional_resolved_state(state_code)
+    if sc is None:
+        raise HTTPException(status_code=400, detail="state_code is required.")
+    try:
+        rows = compare_runs_repo.list_compare_runs_for_state(state_code=sc, limit=limit)
+    except Exception as ex:
+        logger.exception("compare-runs list failed")
+        raise HTTPException(status_code=503, detail=str(ex)) from ex
+    return {"ok": True, "state_code": sc, "compare_runs": [_compare_run_api_row(r) for r in rows]}
+
+
+@app.get("/app/compare-runs/{compare_run_id:int}")
+def app_get_compare_run(
+    compare_run_id: int,
+    state_code: str = Query(..., min_length=2, max_length=8),
+):
+    if not app_db_configured():
+        raise HTTPException(status_code=503, detail="App database not configured.")
+    sc = _optional_resolved_state(state_code)
+    if sc is None:
+        raise HTTPException(status_code=400, detail="state_code is required.")
+    row = compare_runs_repo.get_compare_run(compare_run_id=int(compare_run_id), state_code=sc)
+    if not row:
+        raise HTTPException(status_code=404, detail="Compare run not found.")
+    replay = compare_run_replay_payload(row)
+    if not replay:
+        raise HTTPException(
+            status_code=404,
+            detail="No saved comparison snapshot for this run. Compare again to refresh results.",
+        )
+    return {"ok": True, "compare_run": _compare_run_api_row(row), "replay": replay}
+
+
+@app.get("/app/compare-runs/{compare_run_id:int}/download")
+def app_download_compare_run_workbook(
+    compare_run_id: int,
+    state_code: str = Query(..., min_length=2, max_length=8),
+):
+    if not app_db_configured():
+        raise HTTPException(status_code=503, detail="App database not configured.")
+    sc = _optional_resolved_state(state_code)
+    if sc is None:
+        raise HTTPException(status_code=400, detail="state_code is required.")
+    row = compare_runs_repo.get_compare_run(compare_run_id=int(compare_run_id), state_code=sc)
+    if not row:
+        raise HTTPException(status_code=404, detail="Compare run not found.")
+    rel = str(row.get("changes_workbook_rel_path") or "").strip()
+    if not rel:
+        raise HTTPException(status_code=404, detail="This compare run has no changed workbook.")
+    try:
+        path = resolve_artifact_path(rel)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid stored path") from None
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Workbook missing on disk.")
+    name = path.name
+    media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    return FileResponse(path, media_type=media, filename=name)
 
 
 # -------------------------------------------------------------------
