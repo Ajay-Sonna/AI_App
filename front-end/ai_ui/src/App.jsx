@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as XLSX from 'xlsx'
 import logo from './assets/logo.png'
-import './App.css'
+import './styles/App.css'
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000'
 
@@ -5019,13 +5019,13 @@ export default function App() {
             <>
               <header className="app-main__header">
                 <h2 className="app-main__title">Schedule versions</h2>
-                <p className="app-main__lede">
+                {/* <p className="app-main__lede">
                   Every saved download for the selected state, grouped by <strong>logical fee schedule</strong>. Within each group,
                   rows are ordered by <strong>portal edition date</strong> when we have it (otherwise by fetch time)—newest at the
                   top, older editions below (so you can see Jan&nbsp;5 after an update and still find Jan&nbsp;1 as{' '}
                   <strong>Historical</strong>). Rows marked <strong>Latest</strong> match the Fee Schedules tab (one winner per
                   schedule family after each sync).
-                </p>
+                </p> */}
               </header>
 
               <section className="app-card" aria-labelledby="sched-ver-all-heading">
@@ -5990,7 +5990,7 @@ export default function App() {
             </>
           )}
         </main>
-      </div>
+    </div>
 
       {schedulesCompareOpen ? (
         <div

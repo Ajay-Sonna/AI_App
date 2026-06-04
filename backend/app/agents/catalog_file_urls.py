@@ -112,11 +112,11 @@ def collect_file_urls_from_pipeline_result(
 
     def _add(u: str, label: Optional[str], row: Dict[str, Any], table: Dict[str, Any], *, link: Optional[Dict[str, Any]] = None) -> None:
         u = (u or "").strip()
-        if not u or u in seen:
+        if not u:
             return
         if not _looks_like_file_download(u):
             return
-        seen.add(u)
+        
         cols = ordered_column_names(table)
         link_text = (label or "").strip()
         row_title = fee_schedule_title_from_row(row, cols) or ""
@@ -151,6 +151,10 @@ def collect_file_urls_from_pipeline_result(
             else:
                 lsk = slug_logical_schedule_key("fee_schedule")
 
+        key = (u, lsk)
+        if key in seen:
+            return
+        seen.add(key)
         superseded = row_or_label_superseded_hint(row=row, link_label=link_text)
         if isinstance(link, dict) and str(link.get("superseded_hint") or "").strip() in (
             "1",
