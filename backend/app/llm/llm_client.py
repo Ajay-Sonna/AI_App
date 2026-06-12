@@ -6,7 +6,7 @@ from bs4 import BeautifulSoup
 import re
 import json
 import time
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Dict
 
 client = Groq(api_key=GROQ_API_KEY)
 
